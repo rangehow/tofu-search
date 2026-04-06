@@ -1,0 +1,125 @@
+"""tofu-search — Standalone multi-engine web search with LLM content filtering.
+
+Provides a 7-step search pipeline: multi-engine search, URL dedup,
+content dedup, concurrent page fetch, optional LLM content filter,
+BM25 reranking, and result formatting.
+
+Usage::
+
+    from tofu_search import search, fetch_url, configure
+
+    # Basic search (no LLM filter — still useful):
+    results = search("Python asyncio tutorial")
+
+    # With OpenAI-compatible LLM for content filtering:
+    configure(
+        llm_api_key="sk-...",
+        llm_base_url="https://api.openai.com/v1",
+        llm_model="gpt-4o-mini",
+    )
+    results = search("Python asyncio tutorial")
+
+    # With custom LLM callable:
+    def my_llm(messages, **kwargs):
+        return "your response"
+    configure(llm_function=my_llm)
+    results = search("Python asyncio tutorial")
+
+    # Fetch a single URL:
+    content = fetch_url("https://example.com")
+
+    # Format results for display:
+    text = format_results(results)
+"""
+
+__version__ = '0.1.0'
+
+from tofu_search.config import SearchConfig, configure, get_config
+from tofu_search.fetch.core import (
+    extract_urls_from_text,
+    fetch_page_content,
+    fetch_urls,
+)
+from tofu_search.search.format import format_search_for_tool_response as format_results
+from tofu_search.search.orchestrator import perform_web_search
+
+__all__ = [
+    'search',
+    'fetch_url',
+    'configure',
+    'get_config',
+    'SearchConfig',
+    'perform_web_search',
+    'format_results',
+    'fetch_urls',
+    'fetch_page_content',
+    'extract_urls_from_text',
+]
+
+
+def search(query: str, *, max_results: int | None = None,
+           user_question: str = '', **kwargs) -> list[dict]:
+    """Search the web and return processed results.
+
+    This is the primary public API. Runs the full 7-step pipeline:
+    multi-engine search → URL dedup → content dedup → page fetch →
+    LLM content filter (if configured) → BM25 rerank → format.
+
+    Args:
+        query: Search query string.
+        max_results: Maximum number of results to return.
+                     Default: 6 (configurable via configure(fetch_top_n=N)).
+        user_question: The user's original question (helps LLM filter judge
+                       relevance). If not provided, query is used.
+        **kwargs: Additional SearchConfig overrides for this call only.
+
+    Returns:
+        List of result dicts, each with keys:
+        - title (str): Page title
+        - url (str): Page URL
+        - snippet (str): Search result snippet
+        - source (str): Search engine name
+        - full_content (str, optional): Fetched and cleaned page content
+
+    Example::
+
+        results = search("Python asyncio tutorial")
+        for r in results:
+            print(f"{r['title']}: {r['url']}")
+            if r.get('full_content'):
+                print(f"  Content: {r['full_content'][:200]}...")
+    """
+    config = None
+    if kwargs:
+        config = get_config().copy(**kwargs)
+
+    return perform_web_search(
+        query,
+        max_results=max_results,
+        user_question=user_question or query,
+        config=config,
+    )
+
+
+def fetch_url(url: str, *, max_chars: int | None = None,
+              timeout: int | None = None) -> str | None:
+    """Fetch and extract text content from a single URL.
+
+    Args:
+        url: URL to fetch.
+        max_chars: Max characters of extracted text. Default: 200,000.
+        timeout: Request timeout in seconds. Default: 15.
+
+    Returns:
+        Extracted text content string, or None if fetch failed.
+
+    Example::
+
+        content = fetch_url("https://example.com")
+        if content:
+            print(f"Got {len(content)} chars")
+    """
+    cfg = get_config()
+    if max_chars is None:
+        max_chars = cfg.fetch_max_chars_direct
+    return fetch_page_content(url, max_chars=max_chars, timeout=timeout)
