@@ -32,7 +32,7 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
@@ -40,8 +40,20 @@ from tofu_search.fetch.core import (
     fetch_page_content,
     fetch_urls,
 )
+from tofu_search.providers import (
+    AuthSourceProvider,
+    BrowserProvider,
+    register_auth_source_provider,
+    register_browser_provider,
+)
 from tofu_search.search.format import format_search_for_tool_response as format_results
 from tofu_search.search.orchestrator import perform_web_search
+from tofu_search.search.vertical import (
+    detect_vertical_intent,
+    list_domains,
+    search_vertical,
+    search_vertical_domain,
+)
 
 __all__ = [
     'search',
@@ -54,6 +66,16 @@ __all__ = [
     'fetch_urls',
     'fetch_page_content',
     'extract_urls_from_text',
+    # Vertical (structured-identifier) search
+    'detect_vertical_intent',
+    'search_vertical',
+    'search_vertical_domain',
+    'list_domains',
+    # Provider seams (host integration)
+    'BrowserProvider',
+    'AuthSourceProvider',
+    'register_browser_provider',
+    'register_auth_source_provider',
 ]
 
 

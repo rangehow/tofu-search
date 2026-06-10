@@ -1,4 +1,4 @@
-"""tofu_search.search.engines.searxng — SearXNG public meta-search instances."""
+"""tofu_search/search/engines/searxng.py — SearXNG public meta-search instances."""
 
 import random
 import re
@@ -13,6 +13,8 @@ logger = get_logger(__name__)
 
 __all__ = ['search_searxng']
 
+# Public SearXNG instances — rotated to spread load.
+# Most block JSON API (403), so we scrape HTML and also try JSON.
 _SEARXNG_INSTANCES = [
     'https://search.indst.eu',
     'https://search.einfachzocken.eu',
@@ -29,12 +31,15 @@ _SEARXNG_INSTANCES = [
 def _searxng_parse_html(html, max_results=6):
     """Parse SearXNG HTML search results page."""
     results = []
+    # SearXNG uses <article class="result result-default"> for each result
     article_blocks = re.split(r'<article[^>]*class="[^"]*result[^"]*result-default[^"]*"', html)
     if len(article_blocks) <= 1:
+        # Fallback: try <div class="result result-default">
         article_blocks = re.split(r'<div[^>]*class="[^"]*result[^"]*result-default[^"]*"', html)
     for block in article_blocks[1:]:
         if len(results) >= max_results:
             break
+        # URL + title: <a href="..." class="url_header">...</a>  or  <h3><a href="...">
         link_m = re.search(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
         if not link_m:
             continue
@@ -43,6 +48,7 @@ def _searxng_parse_html(html, max_results=6):
         if not title or not url.startswith('http'):
             continue
 
+        # Snippet: <p class="content"> or <span class="content">
         snippet = ''
         snip_m = re.search(r'class="content"[^>]*>(.*?)</(?:p|span|div)>', block, re.DOTALL)
         if snip_m:
@@ -76,17 +82,44 @@ def _searxng_parse_json(data, max_results=6):
     return results
 
 
-def search_searxng(query, max_results=6):
-    """Query public SearXNG instances with automatic failover."""
+def search_searxng(query, max_results=6, freshness=''):
+    """Query public SearXNG instances with automatic failover.
+
+    Tries JSON API first (fast, structured), falls back to HTML scraping.
+    Rotates across instances to spread load and survive rate-limits.
+
+    Optimised for speed: 2 instances max, 2s timeout per request.
+    Most public instances block datacenter IPs via 302→homepage redirect;
+    we detect this and skip immediately.
+    """
+    import time as _time
+    t0 = _time.time()
     shuffled = list(_SEARXNG_INSTANCES)
     random.shuffle(shuffled)
-    for inst in shuffled[:3]:
+    _TIMEOUT = 2  # seconds — if SearXNG can't respond in 2s, it won't
+    _MAX_INSTANCES = 2  # try at most 2 instances (was 3)
+    # SearXNG supports time_range param: day, week, month, year
+    _FRESHNESS_MAP = {'day': 'day', 'week': 'week', 'month': 'month', 'year': 'year'}
+    time_range = _FRESHNESS_MAP.get(freshness, '')
+
+    for inst in shuffled[:_MAX_INSTANCES]:
         try:
+            # Try JSON first (don't follow redirects — detect 302→homepage)
+            json_params = {'q': query, 'format': 'json', 'engines': 'google,bing,duckduckgo'}
+            if time_range:
+                json_params['time_range'] = time_range
             resp = requests.get(
                 f'{inst}/search',
-                params={'q': query, 'format': 'json', 'engines': 'google,bing,duckduckgo'},
-                headers=HEADERS, timeout=5,
+                params=json_params,
+                headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
             )
+
+            # 302/301 → homepage redirect = bot block, skip immediately
+            if resp.status_code in (301, 302):
+                logger.debug('[Search] SearXNG %s redirected (%d) — bot block, skipping',
+                             inst, resp.status_code)
+                continue
+
             json_results = []
             if resp.ok and 'json' in resp.headers.get('content-type', ''):
                 json_results = _searxng_parse_json(resp.json(), max_results)
@@ -94,16 +127,26 @@ def search_searxng(query, max_results=6):
                     logger.info('[Search] SearXNG JSON from %s: %d results', inst, len(json_results))
                     return json_results
 
+            # Rate-limited — skip to next instance immediately
             if resp.status_code == 429:
                 logger.debug('[Search] SearXNG 429 from %s, trying next instance', inst)
                 continue
 
+            # JSON blocked (403) or empty — try HTML on same instance
             if resp.status_code == 403 or not json_results:
+                html_params = {'q': query}
+                if time_range:
+                    html_params['time_range'] = time_range
                 resp = requests.get(
                     f'{inst}/search',
-                    params={'q': query},
-                    headers=HEADERS, timeout=5,
+                    params=html_params,
+                    headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
                 )
+                # Detect redirect again
+                if resp.status_code in (301, 302):
+                    logger.debug('[Search] SearXNG %s HTML redirected (%d) — bot block',
+                                 inst, resp.status_code)
+                    continue
                 if resp.ok and len(resp.text) > 500:
                     results = _searxng_parse_html(resp.text, max_results)
                     if results:
@@ -111,11 +154,12 @@ def search_searxng(query, max_results=6):
                         return results
 
         except requests.Timeout:
-            logger.debug('[Search] SearXNG timeout: %s', inst)
+            logger.debug('[Search] SearXNG timeout (%ds): %s', _TIMEOUT, inst)
         except requests.RequestException as e:
             logger.debug('[Search] SearXNG %s failed: %s', inst, e)
         except Exception as e:
             logger.warning('[Search] SearXNG %s unexpected error: %s', inst, e, exc_info=True)
 
-    logger.debug('[Search] SearXNG: all instances failed for query: %s', query[:80])
+    elapsed = _time.time() - t0
+    logger.info('[Search] SearXNG: all instances failed in %.1fs  query=%r', elapsed, query[:60])
     return []

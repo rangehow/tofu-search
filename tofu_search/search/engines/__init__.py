@@ -1,1 +1,1 @@
-"""tofu_search.search.engines — Individual search engine implementations."""
+"""tofu_search/search/engines/ — Individual search engine implementations."""

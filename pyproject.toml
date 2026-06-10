@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tofu-search"
-version = "0.1.0"
-description = "Multi-engine web search with LLM content filtering — standalone library from Tofu AI assistant"
+version = "0.2.0"
+description = "Multi-engine web search, vertical lookups, and content fetching with optional LLM filtering — standalone library from the Tofu AI assistant"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "python-dateutil>=2.8",
     "urllib3>=1.26",
+    "lxml>=4.9",
 ]
 
 [project.optional-dependencies]

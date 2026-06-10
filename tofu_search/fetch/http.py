@@ -1,8 +1,12 @@
-"""tofu_search.fetch.http — HTTP request execution with SSL fallback.
+"""tofu_search.fetch.http — HTTP request execution with SSL, Playwright,
+authenticated, and browser-provider fallbacks.
 
-Standalone version — browser extension fallback removed (chatui-specific).
+Contains the low-level HTTP request logic, Playwright fallback, authenticated
+(cookie-replay) fetch, optional host-browser fallback (via
+:mod:`tofu_search.providers`), and the HttpError exception.
 """
 
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -12,19 +16,56 @@ from tofu_search.config import get_config
 from tofu_search.fetch.utils import (
     _HAS_LEGACY_SSL,
     _fetch_cache,
+    _is_bot_extracted_text,
     _session,
     _session_legacy_ssl,
     _session_no_ssl,
 )
 from tofu_search.log import get_logger
+from tofu_search.providers import get_browser_provider
 
 logger = get_logger(__name__)
 
-__all__ = ['HttpError', 'do_request', 'try_playwright_fallback']
+# ── Browser fallback concurrency cap ──
+# The browser provider dispatches fetches via real browser tabs (parallel).
+# The semaphore prevents extreme scenarios (30+ tabs) from overwhelming it.
+_BROWSER_CONCURRENCY_LIMIT = 16
+_browser_semaphore = threading.Semaphore(_BROWSER_CONCURRENCY_LIMIT)
+
+# ── Browser fallback timeout ──
+_BROWSER_TIMEOUT = 15
+
+# ── Domains where browser fallback consistently fails (paywalls, login walls) ──
+_BROWSER_SKIP_DOMAINS = frozenset({
+    'medium.com',
+    'stackademic.com',
+    'towardsdatascience.com',
+    'betterprogramming.pub',
+    'levelup.gitconnected.com',
+    'tandfonline.com',
+    'preprints.org',
+    'ouci.dntb.gov.ua',
+    'ieeexplore.ieee.org',
+    'dl.acm.org',
+    'link.springer.com',
+    'wiley.com',
+    'onlinelibrary.wiley.com',
+    'jstor.org',
+    'nature.com',
+    'science.org',
+})
+
+__all__ = [
+    'HttpError',
+    'do_request',
+    'try_playwright_fallback',
+    'try_authenticated_fetch',
+    'try_browser_fetch',
+]
 
 
 class HttpError(Exception):
-    """HTTP error with status code for caller differentiation."""
+    """HTTP error carrying a status code so callers can differentiate 404 vs 5xx."""
     def __init__(self, status_code, url):
         self.status_code = status_code
         self.url = url
@@ -32,7 +73,10 @@ class HttpError(Exception):
 
 
 def do_request(url, timeout, verify=True, legacy_ssl=False):
-    """Execute a single GET request, return (resp, raw_bytes) or raise."""
+    """Execute a single GET request, return (resp, raw_bytes) or raise.
+
+    Non-2xx responses raise HttpError so the caller can branch on status.
+    """
     cfg = get_config()
     if legacy_ssl and _HAS_LEGACY_SSL:
         sess = _session_legacy_ssl
@@ -41,7 +85,7 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
     else:
         sess = _session_no_ssl
     domain = urlparse(url).netloc[:40]
-    logger.debug('-> GET %s  (timeout=%ds, ssl=%s)', url[:100], timeout, 'Y' if verify else 'N')
+    logger.debug('→ GET %s  (timeout=%ds, ssl=%s)', url[:100], timeout, '✓' if verify else '✗')
     t0 = time.time()
     resp = sess.get(url, timeout=(min(timeout, 8), timeout),
                     stream=True, allow_redirects=True, verify=verify)
@@ -49,13 +93,13 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
     if not resp.ok:
         status = resp.status_code
         resp.close()
-        logger.debug('<- %d in %dms — %s', status, conn_ms, domain)
+        logger.debug('← %d in %dms — %s', status, conn_ms, domain)
         raise HttpError(status, url)
     ct = resp.headers.get('Content-Type', '').lower()
     cl = int(resp.headers.get('Content-Length', 0) or 0)
     if cl > cfg.fetch_max_bytes:
         resp.close()
-        raise HttpError(413, url)
+        raise HttpError(413, url)   # treat as "too large"
     total_deadline = timeout * 3
     chunks, dl = [], 0
     oversized = False
@@ -70,7 +114,8 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
                 break
     except _requests_mod.exceptions.ContentDecodingError as e:
         resp.close()
-        logger.warning('ContentDecodingError, retrying without br — %s: %s', domain, e)
+        logger.warning('ContentDecodingError during download, retrying without br — %s: %s',
+                       domain, e)
         resp2 = sess.get(
             url, timeout=(min(timeout, 8), timeout),
             stream=True, allow_redirects=True, verify=verify,
@@ -80,33 +125,182 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
             resp2.close()
             raise HttpError(resp2.status_code, url)
         chunks, dl = [], 0
-        for chunk in resp2.iter_content(65536):
-            chunks.append(chunk); dl += len(chunk)
-            if dl > cfg.fetch_max_bytes:
-                oversized = True
-                break
-            if time.time() - t0 > total_deadline:
-                break
+        try:
+            for chunk in resp2.iter_content(65536):
+                chunks.append(chunk); dl += len(chunk)
+                if dl > cfg.fetch_max_bytes:
+                    oversized = True
+                    break
+                if time.time() - t0 > total_deadline:
+                    break
+        finally:
+            resp2.close()
         elapsed_ms = int((time.time() - t0) * 1000)
-        logger.debug('<- 200 %sB in %dms (no-br retry) ct=%s — %s',
+        logger.debug('← 200 %sB in %dms (no-br retry) ct=%s — %s',
                      f'{dl:,}', elapsed_ms, ct[:40], domain)
         return resp2, b''.join(chunks)
-    if oversized:
+    except Exception:
+        # Any other error mid-stream (pool closed, socket reset, etc.)
+        # — always close to release the decompressor before GC can crash.
         resp.close()
-        logger.warning('Response body too large (%sB) — %s', f'{dl:,}', url[:80])
+        raise
+    resp.close()
+    if oversized:
+        logger.warning('Response body too large (%sB, limit %sB) — %s',
+                       f'{dl:,}', f'{cfg.fetch_max_bytes:,}', url[:80])
         raise HttpError(413, url)
     elapsed_ms = int((time.time() - t0) * 1000)
-    logger.debug('<- 200 %sB in %dms  ct=%s — %s', f'{dl:,}', elapsed_ms, ct[:40], domain)
+    logger.debug('← 200 %sB in %dms  ct=%s — %s', f'{dl:,}', elapsed_ms, ct[:40], domain)
     return resp, b''.join(chunks)
 
 
+def try_authenticated_fetch(url, source, max_chars, timeout):
+    """Fetch a login-walled URL with a matched auth-source's cookies/proxy.
+
+    ``source`` is a row dict (carries ``cookies`` + optional ``proxy``).
+    Drives the Playwright pool's authenticated context. Returns text or None;
+    guards against a returned bot/login-wall page and caches success.
+    """
+    from tofu_search.fetch.playwright_pool import _pw_pool
+    cookies = source.get('cookies') or []
+    proxy = source.get('proxy') or ''
+    domain = source.get('domain', '?')
+    logger.info('[Fetch] authenticated fetch domain=%s cookies=%d proxy=%s — %s',
+                domain, len(cookies), bool(proxy), url[:100])
+    text = _pw_pool.fetch_authenticated(
+        url, cookies=cookies, proxy=proxy,
+        timeout=max(timeout, 20), max_chars=max_chars)
+    if text and len(text) > 50:
+        if _is_bot_extracted_text(text):
+            logger.info('[Fetch] authenticated fetch returned bot/login text (%d chars), '
+                        'discarding — %s (cookies may be expired)', len(text), url[:80])
+            return None
+        _fetch_cache.put(url, text)
+        if max_chars and len(text) > max_chars:
+            return text[:max_chars] + '\n[…truncated]'
+        return text
+    logger.info('[Fetch] authenticated fetch empty — %s (cookies may be expired)', url[:80])
+    return None
+
+
 def try_playwright_fallback(url, max_chars, timeout):
-    """Try Playwright rendering for SPA / bot-protection fallback."""
+    """Render a page with Playwright (SPA / bot-protection fallback)."""
     from tofu_search.fetch.playwright_pool import _pw_pool
     pw_text = _pw_pool.fetch(url, timeout=max(timeout, 15), max_chars=max_chars)
     if pw_text and len(pw_text) > 50:
+        # ── Guard: Playwright may also return bot-protection content ──
+        if _is_bot_extracted_text(pw_text):
+            logger.debug('🛡️ Playwright returned bot-protection text (%d chars), discarding — %s',
+                         len(pw_text), url[:80])
+            return None
         _fetch_cache.put(url, pw_text)
         if max_chars and len(pw_text) > max_chars:
-            return pw_text[:max_chars] + '\n[...truncated]'
+            return pw_text[:max_chars] + '\n[…truncated]'
         return pw_text
     return None
+
+
+# Browser fallback attempt counter (for periodic summary logging)
+_browser_fallback_stats = {'attempts': 0, 'skipped': 0, 'success': 0, 'fail': 0, 'last_log': 0}
+_browser_fallback_lock = threading.Lock()
+
+
+def _log_browser_fallback_stats():
+    """Log a periodic summary of browser fallback activity (every 60s)."""
+    now = time.time()
+    with _browser_fallback_lock:
+        if now - _browser_fallback_stats['last_log'] < 60:
+            return
+        stats = dict(_browser_fallback_stats)
+        _browser_fallback_stats['last_log'] = now
+    if stats['attempts'] > 0:
+        logger.info('[Fetch] Browser fallback stats (last 60s): '
+                    'attempts=%d success=%d fail=%d skipped=%d',
+                    stats['attempts'], stats['success'],
+                    stats['fail'], stats['skipped'])
+
+
+def try_browser_fetch(url, max_chars, reason='unknown'):
+    """Fetch a page via the host browser provider (if one is registered).
+
+    Useful for 401/403/429/timeout: the server lacks auth/network access but
+    the user's browser may have a logged-in session. Returns text or None.
+    No-op (returns None) when no browser provider is registered — this is the
+    standalone default.
+    """
+    provider = get_browser_provider()
+    if provider is None:
+        return None
+    try:
+        # ── Skip known-paywall domains that never succeed via browser ──
+        domain = urlparse(url).netloc.lower()
+        bare_domain = domain[4:] if domain.startswith('www.') else domain
+        if bare_domain in _BROWSER_SKIP_DOMAINS or any(
+                bare_domain.endswith('.' + d) for d in _BROWSER_SKIP_DOMAINS):
+            with _browser_fallback_lock:
+                _browser_fallback_stats['skipped'] += 1
+            logger.debug('[Fetch] Browser fallback skipped (paywall domain %s) — %s',
+                         bare_domain, url[:80])
+            return None
+
+        if not provider.is_connected():
+            with _browser_fallback_lock:
+                _browser_fallback_stats['skipped'] += 1
+            logger.debug('[Fetch] Browser fallback skipped (provider not connected) — %s', url[:80])
+            return None
+
+        # ── Concurrency cap: skip if too many browser fetches in flight ──
+        if not _browser_semaphore.acquire(blocking=False):
+            with _browser_fallback_lock:
+                _browser_fallback_stats['skipped'] += 1
+            logger.debug('[Fetch] Browser fallback skipped (concurrency limit %d) — %s',
+                         _BROWSER_CONCURRENCY_LIMIT, url[:80])
+            return None
+
+        with _browser_fallback_lock:
+            _browser_fallback_stats['attempts'] += 1
+            attempt_num = _browser_fallback_stats['attempts']
+        logger.info('[Fetch] Browser fallback ATTEMPT #%d reason=%s — %s',
+                    attempt_num, reason, url[:100])
+        bf_t0 = time.time()
+        try:
+            text = provider.fetch_url(url, max_chars=max_chars, timeout=_BROWSER_TIMEOUT)
+        finally:
+            _browser_semaphore.release()
+        bf_elapsed = time.time() - bf_t0
+        if text:
+            # ── Guard: browser may also return bot-protection pages ──
+            if _is_bot_extracted_text(text):
+                logger.debug('🛡️ Browser fallback returned bot-protection text (%d chars), '
+                             'discarding — %s', len(text), url[:80])
+                with _browser_fallback_lock:
+                    _browser_fallback_stats['fail'] += 1
+                return None
+            with _browser_fallback_lock:
+                _browser_fallback_stats['success'] += 1
+            _fetch_cache.put(url, text)
+            logger.info('[Fetch] Browser fallback OK in %.1fs — %s (%d chars)',
+                        bf_elapsed, url[:80], len(text))
+            if max_chars and len(text) > max_chars:
+                return text[:max_chars] + '\n[…truncated]'
+            return text
+        with _browser_fallback_lock:
+            _browser_fallback_stats['fail'] += 1
+        logger.info('[Fetch] Browser fallback returned empty in %.1fs — %s',
+                    bf_elapsed, url[:80])
+        _log_browser_fallback_stats()
+        return None
+    except Exception as e:
+        with _browser_fallback_lock:
+            _browser_fallback_stats['fail'] += 1
+        logger.error('[Fetch] Browser fallback error — %s: %s', url[:80], e, exc_info=True)
+        _log_browser_fallback_stats()
+        return None
+
+
+# Backward-compatible aliases (originally _-prefixed private names)
+_HttpError = HttpError
+_do_request = do_request
+_try_playwright_fallback = try_playwright_fallback
+_try_authenticated_fetch = try_authenticated_fetch
+_try_browser_fetch = try_browser_fetch
