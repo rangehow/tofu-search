@@ -21,7 +21,7 @@ anonymous pipeline rather than crashing it.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, Optional
+from typing import Optional
 
 from tofu_search.log import get_logger
 

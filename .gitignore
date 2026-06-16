@@ -25,4 +25,6 @@ Thumbs.db
 
 # Project-specific
 .chatui/
+.tofu/
+.tofu_trash/
 *.log

@@ -5,7 +5,7 @@ Just searches, fetches pages, and reranks by BM25.
 The LLM content filter is automatically skipped when no LLM is configured.
 """
 
-from tofu_search import search, format_results
+from tofu_search import format_results, search  # noqa: F401  (format_results shown below)
 
 results = search("Python asyncio tutorial", max_results=3)
 

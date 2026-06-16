@@ -149,7 +149,7 @@ def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
 
     # Score each result with BM25
     scored = []
-    for i, (result, doc, dl) in enumerate(zip(results, docs, doc_lens)):
+    for i, (result, doc, dl) in enumerate(zip(results, docs, doc_lens, strict=True)):
         score = 0.0
         # Build term frequency map for query terms only
         tf_map: dict[str, int] = {}

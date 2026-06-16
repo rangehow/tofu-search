@@ -54,7 +54,7 @@ def _strip_manuscript_line_numbers(text):
             if m and len(m.group(3).strip()) > 0:
                 nums.append(int(m.group(1)))
         if len(nums) >= 5:
-            increments = sum(1 for a, b in zip(nums, nums[1:]) if 0 < b - a <= 3)
+            increments = sum(1 for a, b in zip(nums, nums[1:], strict=False) if 0 < b - a <= 3)
             seq_ratio = increments / max(len(nums) - 1, 1)
             if seq_ratio > 0.4:
                 def _strip_leading(line):

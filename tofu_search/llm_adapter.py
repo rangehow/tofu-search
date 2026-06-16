@@ -7,7 +7,6 @@ Provides a unified interface for calling LLMs:
 The adapter normalizes both into a simple: call(messages, **kwargs) -> str
 """
 
-import json
 
 import requests
 

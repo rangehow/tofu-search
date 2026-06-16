@@ -122,8 +122,9 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
             headers={'Accept-Encoding': 'gzip, deflate'},
         )
         if not resp2.ok:
+            status = resp2.status_code
             resp2.close()
-            raise HttpError(resp2.status_code, url)
+            raise HttpError(status, url) from e
         chunks, dl = [], 0
         try:
             for chunk in resp2.iter_content(65536):

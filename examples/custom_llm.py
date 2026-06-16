@@ -4,7 +4,7 @@
 Demonstrates how to provide your own LLM function for content filtering.
 """
 
-from tofu_search import search, configure
+from tofu_search import configure, search
 
 
 def my_echo_llm(messages, **kwargs):

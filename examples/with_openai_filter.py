@@ -9,7 +9,7 @@ Set your API key before running:
 import os
 import sys
 
-from tofu_search import search, configure
+from tofu_search import configure, search
 
 api_key = os.environ.get('OPENAI_API_KEY', '')
 if not api_key:
