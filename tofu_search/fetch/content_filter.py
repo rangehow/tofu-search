@@ -203,7 +203,11 @@ def filter_web_contents_batch(items: list[tuple[str, str]], *,
     if not to_filter:
         return results
 
-    n_workers = len(to_filter)
+    # Cap concurrency: an unbounded pool fans out one LLM call per page,
+    # which can mean dozens of simultaneous requests against the LLM endpoint
+    # (rate-limit / cost / connection-pool exhaustion). 8 is plenty to hide
+    # per-call latency without hammering the backend.
+    n_workers = min(len(to_filter), 8)
     logger.info('[ContentFilter] BATCH filtering %d/%d items  workers=%d',
                 len(to_filter), len(items), n_workers)
 

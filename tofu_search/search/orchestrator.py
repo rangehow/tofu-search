@@ -97,7 +97,6 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     all_results: list[dict] = []
     unique_results: list[dict] = []
     fetch_futs: dict[Future, dict] = {}
-    ok_count = 0
     url_timings: list[tuple] = []
 
     target_ok = config.fetch_top_n * 2
@@ -272,6 +271,11 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         logger.info('[Fetch] Waiting for %d in-flight fetches (started %.1fs ago), target_ok=%d',
                     len(pending_futs), time.time() - (first_fetch_submitted_at or pipeline_t0),
                     target_ok)
+        # Count of KEPT (post-content-dedup) pages that came back with content.
+        # Maintained incrementally as each future completes — the previous
+        # implementation re-scanned all of unique_results on every completion
+        # (O(n²)) which both wasted work and was easy to get wrong.
+        kept_ok = 0
         try:
             for fut in as_completed(pending_futs, timeout=90):
                 try:
@@ -282,15 +286,14 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     url_timings.append((url, fetch_elapsed, ok, chars))
                     if ok:
                         result_dict['full_content'] = content
-                        ok_count += 1
+                        if url in kept_urls:
+                            kept_ok += 1
                     if fetch_elapsed > 5:
                         logger.info('[Fetch] ⚠ SLOW url=%.80s  %.1fs  ok=%s chars=%d',
                                     url, fetch_elapsed, ok, chars)
                 except Exception as e:
                     logger.warning('[Fetch] fetch thread error: %s', e, exc_info=True)
 
-                kept_ok = sum(1 for r in unique_results
-                              if r.get('full_content') and r['url'] in kept_urls)
                 if kept_ok >= target_ok:
                     remaining = [f for f in pending_futs if not f.done()]
                     if remaining:
