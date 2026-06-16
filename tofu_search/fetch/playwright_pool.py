@@ -6,10 +6,10 @@ run Playwright in a dedicated daemon thread and dispatch via a queue.
 """
 
 import atexit
-import sys
 import os
 import queue as _queue_mod
 import re
+import sys
 import threading
 import time
 
@@ -21,6 +21,14 @@ logger = get_logger(__name__)
 __all__ = [
     'PlaywrightPool',
 ]
+
+# Default UA for browser contexts (the fetch/auth/search tasks all used the
+# same Chrome-on-Windows string).
+_DEFAULT_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/125.0.0.0 Safari/537.36'
+)
 
 
 def _ensure_chromium_library_path():
@@ -102,6 +110,10 @@ class PlaywrightPool:
         self._thread = None       # 专用 Playwright 线程
         self._task_q = None       # 发送任务的队列
         self._ready = False       # 浏览器是否就绪
+        # Signalled by the worker thread once the startup attempt finishes
+        # (success OR failure). Replaces an unlocked cross-thread read of
+        # _ready with a proper synchronisation primitive.
+        self._ready_event = threading.Event()
         self._started = False
         self._last_fail_ts = 0     # 上次启动失败时间戳 (防止无限重启)
         self._missing_binary = False  # last launch failed because chromium not installed
@@ -142,6 +154,7 @@ class PlaywrightPool:
                 raise
             logger.info('Playwright browser launched (dedicated thread)')
             self._ready = True
+            self._ready_event.set()
         except Exception as e:
             if getattr(self, '_missing_binary', False):
                 logger.info(
@@ -151,6 +164,16 @@ class PlaywrightPool:
             else:
                 logger.warning('Playwright launch failed: %s', e, exc_info=True)
             self._ready = False
+            # Stop the Playwright driver so its node subprocess doesn't leak.
+            # sync_playwright().start() spawns a long-lived driver process even
+            # when the chromium *launch* fails; without this every failed start
+            # (and every cooldown-triggered restart) orphaned one driver.
+            if pw is not None:
+                try:
+                    pw.stop()
+                except Exception as _stop_err:
+                    logger.debug('[Fetch] playwright stop after launch failure failed: %s',
+                                 _stop_err, exc_info=True)
             # 排空已经在等的任务
             while True:
                 try:
@@ -159,6 +182,8 @@ class PlaywrightPool:
                 except _queue_mod.Empty:
                     logger.debug('[Fetch] Task queue drained after browser launch failure')
                     break
+            # Unblock _ensure_thread waiters (startup attempt finished, failed).
+            self._ready_event.set()
             return
 
         # 主循环: 从队列取任务执行
@@ -211,6 +236,32 @@ class PlaywrightPool:
             pw.stop()
         except Exception as e:
             logger.debug('[Fetch] playwright stop failed: %s', e, exc_info=True)
+
+    def _new_context(self, browser, *, cookies=None, proxy='', locale=None,
+                     java_script_enabled=True, user_agent=_DEFAULT_UA):
+        """Create a browser context with the common options, then add cookies.
+
+        Consolidates the near-identical context setup repeated by the fetch /
+        auth-fetch / auth-search tasks. Cookie-add failures are logged and
+        swallowed (a bad cookie shape should yield the login wall, not abort
+        the whole fetch). Runs on the Playwright worker thread.
+        """
+        ctx_kwargs = dict(
+            user_agent=user_agent,
+            ignore_https_errors=True,
+            java_script_enabled=java_script_enabled,
+        )
+        if locale:
+            ctx_kwargs['locale'] = locale
+        if proxy:
+            ctx_kwargs['proxy'] = {'server': proxy}
+        context = browser.new_context(**ctx_kwargs)
+        if cookies:
+            try:
+                context.add_cookies(cookies)
+            except Exception as e:
+                logger.warning('[Pool] add_cookies failed: %s', e)
+        return context
 
     def _do_pdf_render(self, browser, payload):
         """PDF-render a self-contained HTML document.  Returns bytes or
@@ -286,25 +337,8 @@ class PlaywrightPool:
 
         context = None
         try:
-            ctx_kwargs = dict(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
-                ),
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                locale='zh-CN',
-            )
-            if proxy:
-                ctx_kwargs['proxy'] = {'server': proxy}
-            context = browser.new_context(**ctx_kwargs)
-            if cookies:
-                try:
-                    context.add_cookies(cookies)
-                except Exception as e:
-                    logger.warning('[Pool:authsearch] add_cookies failed for %s: %s',
-                                   url[:80], e)
+            context = self._new_context(browser, cookies=cookies, proxy=proxy,
+                                        locale='zh-CN')
             page = context.new_page()
             page.route('**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,otf,mp4,mp3,webm}',
                        lambda route: route.abort())
@@ -372,27 +406,8 @@ class PlaywrightPool:
 
         context = None
         try:
-            ctx_kwargs = dict(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
-                ),
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                locale='zh-CN',
-            )
-            if proxy:
-                ctx_kwargs['proxy'] = {'server': proxy}
-            context = browser.new_context(**ctx_kwargs)
-            if cookies:
-                try:
-                    context.add_cookies(cookies)
-                except Exception as e:
-                    # Bad cookie shape shouldn't abort the whole fetch — log
-                    # and proceed (likely yields the login wall, handled below).
-                    logger.warning('[Pool:auth] add_cookies failed for %s: %s',
-                                   url[:80], e)
+            context = self._new_context(browser, cookies=cookies, proxy=proxy,
+                                        locale='zh-CN')
             page = context.new_page()
             page.route('**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,otf,mp4,mp3,webm}',
                        lambda route: route.abort())
@@ -454,15 +469,7 @@ class PlaywrightPool:
 
         context = None
         try:
-            context = browser.new_context(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
-                ),
-                ignore_https_errors=True,
-                java_script_enabled=True,
-            )
+            context = self._new_context(browser)
             page = context.new_page()
             # 屏蔽不必要的资源加载 (图片/字体/媒体) 加速渲染
             page.route('**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,otf,mp4,mp3,webm}',
@@ -574,6 +581,7 @@ class PlaywrightPool:
             self._started = True
             self._task_q = _queue_mod.Queue()
             self._ready = False
+            self._ready_event.clear()
             self._thread = threading.Thread(
                 target=self._worker_loop,
                 args=(self._task_q,),
@@ -581,11 +589,11 @@ class PlaywrightPool:
                 name='pw-worker',
             )
             self._thread.start()
-            # 等待浏览器启动完成 (最多 15 秒)
-            for _ in range(150):
-                if self._ready or not self._thread.is_alive():
-                    break
-                time.sleep(0.1)
+            # Wait for the worker to finish its startup attempt (success OR
+            # failure both set _ready_event). The worker sets self._ready
+            # before the event, so reading it here is safe (event provides the
+            # happens-before barrier).
+            self._ready_event.wait(timeout=15)
             if not self._ready:
                 if self._missing_binary:
                     # Already explained at INFO above — don't escalate to ERROR
