@@ -4,7 +4,9 @@ Extracted from chatui lib/fetch.py to keep the main module focused on fetch logi
 All symbols are re-imported by tofu_search.fetch for backward compatibility.
 """
 
+import ipaddress
 import re
+import socket
 import ssl
 import threading
 import time
@@ -101,6 +103,24 @@ _HEADERS = {
 #  连接池（带正确的重试策略）
 # ═══════════════════════════════════════════════════════
 
+class _SSRFGuardAdapter(HTTPAdapter):
+    """HTTPAdapter that rejects requests to internal addresses.
+
+    ``requests`` invokes ``adapter.send`` once per hop, so validating the
+    request URL here guards the initial fetch AND every redirect target —
+    closing the redirect-based SSRF hole that a one-shot pre-flight check on
+    the original URL would miss. The check is a no-op when
+    ``block_private_addresses`` is disabled in config.
+    """
+    def send(self, request, **kwargs):
+        if get_config().block_private_addresses:
+            host = urlparse(request.url).hostname or ''
+            if not _host_is_safe(host):
+                raise requests.exceptions.InvalidURL(
+                    f'SSRF guard: blocked internal address for host {host!r}')
+        return super().send(request, **kwargs)
+
+
 _retry_strategy = Retry(
     total=2,                    # 最多重试2次（共3次请求）
     read=0,                     # ← 禁止 read-timeout 重试（8s 都读不出来，重试也白搭）
@@ -113,7 +133,7 @@ _retry_strategy = Retry(
 
 _session = requests.Session()
 _session.headers.update(_HEADERS)
-_adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=_retry_strategy)
+_adapter = _SSRFGuardAdapter(pool_connections=100, pool_maxsize=100, max_retries=_retry_strategy)
 _session.mount('https://', _adapter)
 _session.mount('http://', _adapter)
 
@@ -121,7 +141,7 @@ _session.mount('http://', _adapter)
 _session_no_ssl = requests.Session()
 _session_no_ssl.headers.update(_HEADERS)
 _session_no_ssl.verify = False
-_adapter_no_ssl = HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=_retry_strategy)
+_adapter_no_ssl = _SSRFGuardAdapter(pool_connections=32, pool_maxsize=32, max_retries=_retry_strategy)
 _session_no_ssl.mount('https://', _adapter_no_ssl)
 _session_no_ssl.mount('http://', _adapter_no_ssl)
 
@@ -133,8 +153,8 @@ try:
     _legacy_ctx.verify_mode = ssl.CERT_NONE
     _legacy_ctx.options |= getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4)
 
-    class _LegacySSLAdapter(HTTPAdapter):
-        """HTTPAdapter that allows unsafe legacy TLS renegotiation."""
+    class _LegacySSLAdapter(_SSRFGuardAdapter):
+        """SSRF-guarded HTTPAdapter that allows unsafe legacy TLS renegotiation."""
         def init_poolmanager(self, *a, **kw):
             kw['ssl_context'] = _legacy_ctx
             return super().init_poolmanager(*a, **kw)
@@ -146,7 +166,7 @@ try:
     _session_legacy_ssl.headers.update(_HEADERS)
     _session_legacy_ssl.verify = False
     _session_legacy_ssl.mount('https://', _LegacySSLAdapter(
-        pool_connections=5, pool_maxsize=10, max_retries=_retry_strategy))
+        pool_connections=32, pool_maxsize=32, max_retries=_retry_strategy))
     _session_legacy_ssl.mount('http://', _adapter_no_ssl)
     _HAS_LEGACY_SSL = True
 except Exception as e:
@@ -603,6 +623,51 @@ def _normalize_code_hosting_url(url):
     return url
 
 
+# ═══════════════════════════════════════════════════════
+#  SSRF guard — block private / loopback / reserved targets
+# ═══════════════════════════════════════════════════════
+
+def _ip_is_blocked(ip_str: str) -> bool:
+    """True if ``ip_str`` is a private / loopback / link-local / reserved address."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _host_is_safe(host: str) -> bool:
+    """Return False if ``host`` resolves to (or literally is) a blocked address.
+
+    Resolves the hostname and rejects the fetch if ANY resolved address is in a
+    private / loopback / link-local / reserved range. This blocks SSRF to cloud
+    metadata endpoints (169.254.169.254), localhost, and RFC-1918 networks.
+    Called for the initial URL and re-checked on every redirect hop.
+    """
+    if not host:
+        return False
+    host = host.strip().strip('[]')  # strip IPv6 brackets
+    # Literal IP?
+    try:
+        ipaddress.ip_address(host)
+        return not _ip_is_blocked(host)
+    except ValueError:
+        pass
+    # Hostname → resolve all addresses; block if any is internal.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        # Can't resolve — let the normal request path fail/log it.
+        return True
+    for info in infos:
+        addr = info[4][0]
+        if _ip_is_blocked(addr):
+            logger.warning('[Fetch] SSRF guard: host %s resolves to blocked address %s', host, addr)
+            return False
+    return True
+
+
 def _should_fetch(url):
     try:
         p = urlparse(url)
@@ -614,6 +679,10 @@ def _should_fetch(url):
             logger.debug('[Fetch] Skipping URL with no netloc: %.80s', url)
             return False
         if any(s in p.netloc.lower() for s in get_config().skip_domains): return False
+        # ── SSRF guard: reject hosts that resolve to internal addresses ──
+        if get_config().block_private_addresses and not _host_is_safe(p.hostname or ''):
+            logger.warning('⛔ Skipped (SSRF guard, internal address): %s', url[:80])
+            return False
         if any(p.path.lower().endswith(e) for e in
                ('.jpg','.jpeg','.png','.gif','.svg','.mp4','.mp3','.zip','.tar','.gz','.exe')):
             return False

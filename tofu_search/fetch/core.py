@@ -145,8 +145,13 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
                 _circuit.record_failure(url)
                 logger.error('SSL-legacy-fallback also failed — %s: %s', url[:80], e2, exc_info=True)
                 return None
+        elif not cfg.allow_insecure_ssl_fallback:
+            logger.warning('SSL verification failed and insecure fallback is disabled '
+                           '(set allow_insecure_ssl_fallback=True to enable) — %s: %s', domain, e)
+            return None
         else:
-            logger.warning('SSL failed, retrying without verify — %s: %s', domain, e, exc_info=True)
+            logger.warning('⚠️ SSL failed, retrying WITHOUT certificate verification (insecure) — %s: %s',
+                           domain, e, exc_info=True)
             try:
                 resp, raw = _do_request(url, timeout, verify=False)
             except _HttpError as e2:

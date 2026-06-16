@@ -8,7 +8,7 @@ configure()) and per-call overrides.
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 __all__ = ['SearchConfig', 'get_config', 'configure']
 
@@ -28,6 +28,15 @@ class SearchConfig:
     fetch_max_chars_direct: int = 200_000
     fetch_max_chars_pdf: int = 0  # 0 = unlimited
     fetch_max_bytes: int = 20 * 1024 * 1024  # 20 MB
+
+    # ── Security ──
+    # Block fetches whose host resolves to a private / loopback / link-local /
+    # reserved address (SSRF guard). Applies to the initial URL *and* every
+    # redirect hop. Leave on unless you deliberately fetch internal hosts.
+    block_private_addresses: bool = True
+    # When a TLS certificate cannot be verified, retry with verification
+    # DISABLED. Off by default — enabling exposes those fetches to MITM.
+    allow_insecure_ssl_fallback: bool = False
 
     # ── Domains to skip (media, social, etc.) ──
     skip_domains: set = field(default_factory=lambda: {
