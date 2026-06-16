@@ -31,8 +31,6 @@ def format_search_for_tool_response(results, search_diag=None):
             elif reason == 'partial_network_error':
                 return ("Search returned 0 results. %s "
                         "Try rephrasing the query or using fetch_url on a specific URL." % detail)
-            elif reason == 'exception':
-                return "Search failed due to an internal error. %s" % detail
             else:
                 return ("Search returned 0 results — no matching content was found across all engines. "
                         "Try rephrasing with different keywords, using fewer/broader terms, "

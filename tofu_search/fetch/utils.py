@@ -70,16 +70,6 @@ except ImportError as e:
     HAS_FITZ = False
     logger.warning('[Fetch] pymupdf not installed — PDF parsing disabled: %s', e)
 
-try:
-    from PIL import Image  # noqa: F401
-    HAS_PIL = True
-except ImportError as e:
-    Image = None  # type: ignore[assignment]
-    HAS_PIL = False
-    logger.warning('[Fetch] Pillow not installed — image processing disabled: %s', e)
-
-HAS_PYPDF2 = False
-
 
 # ═══════════════════════════════════════════════════════
 #  Constants & compiled patterns
