@@ -12,12 +12,10 @@ query-relevant results. We therefore always send an explicit ``mkt`` +
 
 import base64
 import os
-import re
-from html import unescape
 from urllib.parse import parse_qs, urlparse
 
 from tofu_search.log import get_logger
-from tofu_search.search._common import clean_text, http_search_get
+from tofu_search.search._common import http_search_get, make_result, soup_of
 
 logger = get_logger(__name__)
 
@@ -94,36 +92,21 @@ def _bing_decode_url(raw_url):
 
 
 def _parse_bing(resp):
-    """Parse Bing HTML response into result dicts."""
+    """Parse Bing HTML response into result dicts (bs4 CSS selectors)."""
     results = []
-    blocks = resp.text.split('class="b_algo"')
-    for block in blocks[1:]:
-        # Title + URL from <h2><a href="...">Title</a></h2>
-        h2_m = re.search(
-            r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            block, re.DOTALL)
-        if not h2_m:
+    soup = soup_of(resp.text)
+    for li in soup.select('li.b_algo'):
+        a = li.select_one('h2 a[href]')
+        if not a:
             continue
-        raw_url = unescape(h2_m.group(1))
-        title = re.sub(r'<[^>]+>', '', h2_m.group(2)).strip()
-
         # Decode Bing redirect to real URL; drop undecodable redirects
-        url = _bing_decode_url(raw_url)
+        url = _bing_decode_url(a['href'])
         if not url or not url.startswith('http'):
             continue
-
-        # Snippet from first <p>
-        snippet = ''
-        sm = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
-        if sm:
-            snippet = re.sub(r'<[^>]+>', '', unescape(sm.group(1))).strip()
-
-        results.append({
-            'title': clean_text(title)[:200],
-            'snippet': clean_text(snippet)[:500],
-            'url': url,
-            'source': 'Bing',
-        })
+        title = a.get_text(' ', strip=True)
+        p = li.select_one('p')
+        snippet = p.get_text(' ', strip=True) if p else ''
+        results.append(make_result(title, snippet, url, 'Bing'))
 
     # Parse-health signal: a substantial page that yields 0 result blocks is a
     # silent scraper break (layout A/B test, consent interstitial, soft block)

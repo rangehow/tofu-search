@@ -1,10 +1,9 @@
 """tofu_search/search/engines/ddg.py — DuckDuckGo HTML lite + Instant Answer API."""
 
-import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 from tofu_search.log import get_logger
-from tofu_search.search._common import clean_text, http_search_get
+from tofu_search.search._common import clean_text, http_search_get, make_result, soup_of
 
 logger = get_logger(__name__)
 
@@ -12,35 +11,33 @@ __all__ = ['search_ddg_html', 'search_ddg_api']
 
 
 def _parse_ddg_html(resp):
-    """Parse DuckDuckGo lite HTML response into result dicts."""
+    """Parse DuckDuckGo lite HTML response into result dicts (bs4 selectors)."""
     results = []
-    blocks = resp.text.split('class="result results_links')
-    link_re = re.compile(r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL)
-    snip_re = re.compile(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
-    for block in blocks[1:]:
-        lm = link_re.search(block)
-        if not lm:
-            continue
-        raw_url = lm.group(1)
-        title = re.sub(r'<[^>]+>', '', lm.group(2)).strip()
-        snippet = ''
-        sm = snip_re.search(block)
-        if sm:
-            snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip()
+    soup = soup_of(resp.text)
+    for a in soup.select('a.result__a[href]'):
+        raw_url = a['href']
         if '/y.js?' in raw_url and 'ad_' in raw_url:
             continue
+        # DDG wraps the destination in a uddg= redirect param.
         url = raw_url
         if 'uddg=' in raw_url:
             try:
                 url = unquote(parse_qs(urlparse(raw_url).query).get('uddg', [raw_url])[0])
             except Exception as e:
                 logger.debug('[Search] uddg URL decode failed: %s (%s)', raw_url[:100], e)
-        if url.startswith('http'):
-            results.append({
-                'title': clean_text(title)[:200],
-                'snippet': clean_text(snippet)[:500],
-                'url': url, 'source': 'DuckDuckGo',
-            })
+        if raw_url.startswith('//'):
+            url = 'https:' + url if url.startswith('//') else url
+        if not url.startswith('http'):
+            continue
+        title = a.get_text(' ', strip=True)
+        # The snippet anchor lives in the same result block.
+        snippet = ''
+        block = a.find_parent(class_='result')
+        if block:
+            snip = block.select_one('.result__snippet')
+            if snip:
+                snippet = snip.get_text(' ', strip=True)
+        results.append(make_result(title, snippet, url, 'DuckDuckGo'))
     return results
 
 

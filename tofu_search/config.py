@@ -45,6 +45,20 @@ class SearchConfig:
         'linkedin.com', 'discord.com',
     })
 
+    # ── SearXNG public instances (rotated to spread load / survive blocks) ──
+    # Public instances churn — override this list when the defaults go stale.
+    searxng_instances: list = field(default_factory=lambda: [
+        'https://search.indst.eu',
+        'https://search.einfachzocken.eu',
+        'https://priv.au',
+        'https://paulgo.io',
+        'https://search.charliewhiskey.net',
+        'https://search.freestater.org',
+        'https://search.catboy.house',
+        'https://search.hbubli.cc',
+        'https://opnxng.com',
+    ])
+
     # ── LLM configuration for content filter ──
     # Option A: OpenAI-compatible endpoint
     llm_api_key: str = ''

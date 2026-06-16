@@ -8,59 +8,47 @@ import re
 from html import unescape
 
 from tofu_search.log import get_logger
-from tofu_search.search._common import clean_text, http_search_get
+from tofu_search.search._common import http_search_get, make_result, soup_of
 
 logger = get_logger(__name__)
 
 __all__ = ['search_brave']
 
+_AGO_PREFIX_RE = re.compile(r'^\d+\s+\w+\s+ago\s*[-–—]\s*')
+
 
 def _parse_brave(resp):
-    """Parse Brave HTML response into result dicts."""
+    """Parse Brave HTML response into result dicts (bs4 CSS selectors)."""
     results = []
-    html = resp.text
-    # Each organic result lives in a data-pos="N" block
-    pos_blocks = re.split(r'data-pos="\d+"', html)
-    for block in pos_blocks[1:]:
-        # URL: first <a href="https://..."> with svelte class
-        url_m = re.search(
-            r'<a[^>]*href="(https?://[^"]+)"[^>]*class="[^"]*svelte', block)
-        if not url_m:
+    soup = soup_of(resp.text)
+    # Each organic result lives in a [data-pos] container.
+    for block in soup.select('[data-pos]'):
+        a = block.select_one('a[href^="http"]')
+        if not a:
             continue
-        url = unescape(url_m.group(1))
+        url = a['href']
         # Skip Brave's own domains (ads, internal)
         if 'search.brave.com' in url or 'brave.com/search' in url:
             continue
 
-        # Title: inside .search-snippet-title (via title attr or inner text)
+        title_node = block.select_one('.search-snippet-title, .title')
         title = ''
-        title_attr = re.search(
-            r'class="title search-snippet-title[^"]*"[^>]*title="([^"]+)"', block)
-        if title_attr:
-            title = unescape(title_attr.group(1))
-        else:
-            title_div = re.search(
-                r'class="title search-snippet-title[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
-            if title_div:
-                title = re.sub(r'<[^>]+>', '', title_div.group(1)).strip()
+        if title_node:
+            title = title_node.get('title') or title_node.get_text(' ', strip=True)
+        if not title:
+            title = a.get('title') or a.get_text(' ', strip=True)
         if not title:
             continue
 
-        # Snippet: inside .generic-snippet .content
-        snippet = ''
-        snip_m = re.search(
-            r'class="content[^"]*svelte[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
-        if snip_m:
-            snippet = re.sub(r'<[^>]+>', '', unescape(snip_m.group(1))).strip()
-            # Remove leading date prefix like "2 days ago -"
-            snippet = re.sub(r'^\d+\s+\w+\s+ago\s*[-–—]\s*', '', snippet)
+        snip_node = block.select_one('.snippet-content, .content, .snippet-description')
+        snippet = snip_node.get_text(' ', strip=True) if snip_node else ''
+        snippet = _AGO_PREFIX_RE.sub('', unescape(snippet))
 
-        results.append({
-            'title': clean_text(title)[:200],
-            'snippet': clean_text(snippet)[:500],
-            'url': url,
-            'source': 'Brave',
-        })
+        results.append(make_result(title, snippet, url, 'Brave'))
+
+    if not results and len(resp.text) > 20000:
+        logger.warning('[Search] Brave 200 but parsed 0 result blocks (%d bytes) — '
+                       'likely layout change or soft block', len(resp.text))
     return results
 
 

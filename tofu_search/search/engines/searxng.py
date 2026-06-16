@@ -1,65 +1,43 @@
 """tofu_search/search/engines/searxng.py — SearXNG public meta-search instances."""
 
 import random
-import re
-from html import unescape
 
 import requests
 
+from tofu_search.config import get_config
 from tofu_search.log import get_logger
-from tofu_search.search._common import HEADERS, clean_text
+from tofu_search.search._common import (
+    HEADERS,
+    make_result,
+    search_session,
+    soup_of,
+)
 
 logger = get_logger(__name__)
 
 __all__ = ['search_searxng']
 
-# Public SearXNG instances — rotated to spread load.
-# Most block JSON API (403), so we scrape HTML and also try JSON.
-_SEARXNG_INSTANCES = [
-    'https://search.indst.eu',
-    'https://search.einfachzocken.eu',
-    'https://priv.au',
-    'https://paulgo.io',
-    'https://search.charliewhiskey.net',
-    'https://search.freestater.org',
-    'https://search.catboy.house',
-    'https://search.hbubli.cc',
-    'https://opnxng.com',
-]
-
 
 def _searxng_parse_html(html, max_results=6):
-    """Parse SearXNG HTML search results page."""
+    """Parse SearXNG HTML search results page (bs4 selectors)."""
     results = []
-    # SearXNG uses <article class="result result-default"> for each result
-    article_blocks = re.split(r'<article[^>]*class="[^"]*result[^"]*result-default[^"]*"', html)
-    if len(article_blocks) <= 1:
-        # Fallback: try <div class="result result-default">
-        article_blocks = re.split(r'<div[^>]*class="[^"]*result[^"]*result-default[^"]*"', html)
-    for block in article_blocks[1:]:
+    soup = soup_of(html)
+    # SearXNG renders each result as <article class="result result-default">;
+    # older / themed instances use <div class="result ...">.
+    blocks = soup.select('article.result, div.result')
+    for block in blocks:
         if len(results) >= max_results:
             break
-        # URL + title: <a href="..." class="url_header">...</a>  or  <h3><a href="...">
-        link_m = re.search(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
-        if not link_m:
+        a = block.select_one('h3 a[href^="http"], a.url_header[href^="http"], a[href^="http"]')
+        if not a:
             continue
-        url = unescape(link_m.group(1))
-        title = re.sub(r'<[^>]+>', '', link_m.group(2)).strip()
+        url = a['href']
+        title = a.get_text(' ', strip=True)
         if not title or not url.startswith('http'):
             continue
-
-        # Snippet: <p class="content"> or <span class="content">
-        snippet = ''
-        snip_m = re.search(r'class="content"[^>]*>(.*?)</(?:p|span|div)>', block, re.DOTALL)
-        if snip_m:
-            snippet = re.sub(r'<[^>]+>', '', unescape(snip_m.group(1))).strip()
-
-        results.append({
-            'title': clean_text(title)[:200],
-            'snippet': clean_text(snippet)[:500],
-            'url': url,
-            'source': 'SearXNG',
-        })
+        snip = block.select_one('.content, p.content')
+        snippet = snip.get_text(' ', strip=True) if snip else ''
+        results.append(make_result(title, snippet, url, 'SearXNG'))
     return results
 
 
@@ -73,12 +51,7 @@ def _searxng_parse_json(data, max_results=6):
         title = item.get('title', '')
         if not url or not title:
             continue
-        results.append({
-            'title': clean_text(title)[:200],
-            'snippet': clean_text(item.get('content', ''))[:500],
-            'url': url,
-            'source': 'SearXNG',
-        })
+        results.append(make_result(title, item.get('content', ''), url, 'SearXNG'))
     return results
 
 
@@ -94,7 +67,7 @@ def search_searxng(query, max_results=6, freshness=''):
     """
     import time as _time
     t0 = _time.time()
-    shuffled = list(_SEARXNG_INSTANCES)
+    shuffled = list(get_config().searxng_instances)
     random.shuffle(shuffled)
     _TIMEOUT = 2  # seconds — if SearXNG can't respond in 2s, it won't
     _MAX_INSTANCES = 2  # try at most 2 instances (was 3)
@@ -108,7 +81,7 @@ def search_searxng(query, max_results=6, freshness=''):
             json_params = {'q': query, 'format': 'json', 'engines': 'google,bing,duckduckgo'}
             if time_range:
                 json_params['time_range'] = time_range
-            resp = requests.get(
+            resp = search_session.get(
                 f'{inst}/search',
                 params=json_params,
                 headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
@@ -137,7 +110,7 @@ def search_searxng(query, max_results=6, freshness=''):
                 html_params = {'q': query}
                 if time_range:
                     html_params['time_range'] = time_range
-                resp = requests.get(
+                resp = search_session.get(
                     f'{inst}/search',
                     params=html_params,
                     headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
