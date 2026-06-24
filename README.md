@@ -30,6 +30,9 @@ stays dependency-free when used standalone.
 - **SPA / bot-protection support**: optional Playwright fallback for
   JS-rendered and challenge pages.
 - **PDF extraction**: optional pymupdf / pymupdf4llm integration.
+- **File assets**: text-based assets (SVG, JSON, XML, YAML, CSS, JS, source
+  code) are returned as their raw source by `fetch_page_content`; binary
+  assets can be downloaded with the size-/SSRF-guarded `fetch_url_bytes`.
 - **Host integration seams**: register a browser provider (fetch/search via a
   real browser the user controls) and an auth-source provider (cookies/proxy
   for login-walled domains) — both no-ops by default.
@@ -88,6 +91,29 @@ from tofu_search import fetch_url
 content = fetch_url("https://example.com")
 if content:
     print(f"Got {len(content)} characters")
+```
+
+Text-based file assets (SVG, JSON, XML, YAML, CSS, JS, source code) are
+returned as their raw source — there's nothing to "extract":
+
+```python
+svg = fetch_url("https://example.com/icon.svg")   # the <svg>…</svg> markup
+```
+
+For **binary** assets (images, archives, fonts, Office docs) use
+`fetch_url_bytes`, which returns the undecoded body + content-type under the
+same scheme / SSRF / size-cap policy as the text pipeline:
+
+```python
+from tofu_search import fetch_url_bytes, looks_like_text_asset
+
+got = fetch_url_bytes("https://example.com/logo.png")
+if got:
+    raw, content_type = got
+    open("logo.png", "wb").write(raw)
+
+looks_like_text_asset("https://example.com/a.svg")   # True
+looks_like_text_asset("https://example.com/a.png")   # False
 ```
 
 ### Vertical (structured-identifier) search

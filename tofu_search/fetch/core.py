@@ -31,10 +31,12 @@ from tofu_search.fetch.utils import (
     _circuit,
     _decode_bytes,
     _fetch_cache,
+    _host_is_safe,
     _html_head_cache,
     _is_bot_extracted_text,
     _is_bot_protection,
     _is_known_spa,
+    _is_text_asset_ct,
     _looks_like_spa_shell,
     _normalize_code_hosting_url,
     _session,
@@ -47,6 +49,7 @@ logger = get_logger(__name__)
 
 __all__ = [
     'fetch_page_content',
+    'fetch_url_bytes',
     'get_publish_date_from_url',
     'fetch_contents_for_results',
     'fetch_urls',
@@ -221,6 +224,22 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
             text = _decode_bytes(raw, resp.encoding).strip()
             result = (text[:_CACHE_EXTRACT_LIMIT] if len(text) > _CACHE_EXTRACT_LIMIT
                       else text) if len(text) > 30 else None
+        elif _is_text_asset_ct(ct):
+            # Text-based file asset (SVG, JSON, XML, YAML, CSS, JS, source code).
+            # Return the raw source directly — there's nothing to "extract", and
+            # the article-oriented bot/SPA/min-length gates below don't apply
+            # (a 40-char JSON or tiny SVG is a complete, valid file). Return early.
+            text = _decode_bytes(raw, resp.encoding).strip()
+            if not text:
+                logger.debug('Empty text asset (ct=%s) — %s', ct[:40], url[:80])
+                return None
+            if len(text) > _CACHE_EXTRACT_LIMIT:
+                text = text[:_CACHE_EXTRACT_LIMIT]
+            logger.debug('Text asset (ct=%s, %d chars) — %s', ct[:40], len(text), url[:80])
+            _fetch_cache.put(url, text)
+            if max_chars and len(text) > max_chars:
+                return text[:max_chars] + '\n[…truncated]'
+            return text
         else:
             html = _decode_bytes(raw, resp.encoding)
             if _is_bot_protection(html):
@@ -265,6 +284,65 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
         return result
     logger.debug('Empty result (len=%d) — %s', len(result) if result else 0, url[:80])
     return None
+
+
+# ═══════════════════════════════════════════════════════
+#  Raw byte fetch (for binary file assets)
+# ═══════════════════════════════════════════════════════
+
+def fetch_url_bytes(url, timeout=None, max_bytes=None):
+    """Download the raw bytes of a URL — for binary file assets.
+
+    Unlike :func:`fetch_page_content` (which extracts *text* and returns
+    ``None`` for binary content), this returns the undecoded body so the
+    caller can save an image / archive / Office document to disk. Enforces
+    the SAME safety policy as the text pipeline:
+
+      * scheme must be http/https,
+      * SSRF guard (``block_private_addresses``) rejects internal hosts,
+      * size cap (``max_bytes`` → defaults to ``config.fetch_max_bytes``).
+
+    Args:
+        url: Target URL.
+        timeout: Request timeout in seconds (default ``config.fetch_timeout``).
+        max_bytes: Hard cap on download size (default ``config.fetch_max_bytes``).
+
+    Returns:
+        ``(raw_bytes, content_type)`` on success, or ``None`` if the URL was
+        rejected (bad scheme / SSRF / too large) or the download failed.
+    """
+    cfg = get_config()
+    if timeout is None:
+        timeout = cfg.fetch_timeout
+    if max_bytes is None:
+        max_bytes = cfg.fetch_max_bytes
+
+    p = urlparse(url)
+    if p.scheme not in ('http', 'https') or not p.netloc:
+        logger.debug('[Fetch] bytes: rejected non-HTTP URL — %.80s', url)
+        return None
+    if cfg.block_private_addresses and not _host_is_safe(p.hostname or ''):
+        logger.warning('⛔ bytes: SSRF guard blocked internal address — %s', url[:80])
+        return None
+
+    try:
+        resp, raw = _do_request(url, timeout, verify=True)
+    except _HttpError as e:
+        logger.debug('[Fetch] bytes: HTTP %d — %s', e.status_code, url[:120])
+        return None
+    except Exception as e:
+        logger.warning('[Fetch] bytes: download failed — %s: %s', url[:80], e)
+        return None
+
+    if not raw:
+        return None
+    if len(raw) > max_bytes:
+        logger.info('[Fetch] bytes: body exceeds cap (%d > %d) — %s',
+                    len(raw), max_bytes, url[:80])
+        return None
+    ct = (resp.headers.get('Content-Type') or '').lower()
+    logger.debug('[Fetch] bytes: OK %d bytes ct=%s — %s', len(raw), ct[:40], url[:80])
+    return raw, ct
 
 
 # ═══════════════════════════════════════════════════════

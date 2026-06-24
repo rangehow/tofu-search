@@ -5,6 +5,7 @@ All symbols are re-imported by tofu_search.fetch for backward compatibility.
 """
 
 import ipaddress
+import os
 import re
 import socket
 import ssl
@@ -658,6 +659,50 @@ def _host_is_safe(host: str) -> bool:
     return True
 
 
+def _is_text_asset_ct(ct: str) -> bool:
+    """True if a Content-Type denotes a TEXT-based file asset we can return as
+    source directly (SVG, JSON, XML, YAML, CSS, JS, source code, …).
+
+    Excludes ``text/html`` (that's the trafilatura extraction path) and
+    ``text/plain`` (handled by its own dedicated branch upstream).
+    """
+    ct = (ct or '').lower()
+    if 'html' in ct:
+        return False
+    if ct.startswith('text/'):  # text/css, text/markdown, text/csv, text/x-python, …
+        return 'plain' not in ct
+    return any(m in ct for m in (
+        'image/svg', '+xml', '+json', 'application/json', 'application/xml',
+        'application/javascript', 'application/x-yaml', 'application/x-yml',
+        'application/toml',
+    ))
+
+
+# File extensions whose content is source/markup, NOT prose — fetched verbatim
+# and must NOT be run through the article noise/relevance filter.
+_TEXT_ASSET_EXTS = frozenset({
+    '.svg', '.xml', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.csv', '.tsv', '.md', '.rst', '.css', '.scss', '.less',
+    '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.rb', '.go', '.rs',
+    '.java', '.kt', '.c', '.h', '.cpp', '.hpp', '.cc', '.cs', '.php', '.swift',
+    '.scala', '.sh', '.bash', '.zsh', '.sql', '.lua', '.pl', '.r',
+    '.patch', '.diff', '.gradle', '.properties', '.tf',
+})
+
+
+def looks_like_text_asset(url: str) -> bool:
+    """True if ``url``'s path ends in a known source/markup file extension.
+
+    Lets a caller treat a fetched URL as a verbatim source file (skip the
+    article content filter) rather than a prose web page.
+    """
+    try:
+        ext = os.path.splitext(urlparse(url).path)[1].lower()
+    except Exception:
+        return False
+    return ext in _TEXT_ASSET_EXTS
+
+
 def _should_fetch(url):
     try:
         p = urlparse(url)
@@ -673,8 +718,11 @@ def _should_fetch(url):
         if get_config().block_private_addresses and not _host_is_safe(p.hostname or ''):
             logger.warning('⛔ Skipped (SSRF guard, internal address): %s', url[:80])
             return False
+        # Skip BINARY media (can't be extracted as text). ``.svg`` is text and
+        # is handled by the text-asset branch in fetch_page_content, so it is
+        # deliberately NOT in this list.
         if any(p.path.lower().endswith(e) for e in
-               ('.jpg','.jpeg','.png','.gif','.svg','.mp4','.mp3','.zip','.tar','.gz','.exe')):
+               ('.jpg','.jpeg','.png','.gif','.mp4','.mp3','.zip','.tar','.gz','.exe')):
             return False
         # 域名级熔断检查
         if _circuit.is_open(url):

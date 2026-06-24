@@ -32,14 +32,16 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
     extract_urls_from_text,
     fetch_page_content,
+    fetch_url_bytes,
     fetch_urls,
 )
+from tofu_search.fetch.utils import looks_like_text_asset
 from tofu_search.providers import (
     AuthSourceProvider,
     BrowserProvider,
@@ -65,6 +67,8 @@ __all__ = [
     'format_results',
     'fetch_urls',
     'fetch_page_content',
+    'fetch_url_bytes',
+    'looks_like_text_asset',
     'extract_urls_from_text',
     # Vertical (structured-identifier) search
     'detect_vertical_intent',
