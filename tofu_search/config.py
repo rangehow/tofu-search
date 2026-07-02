@@ -29,6 +29,19 @@ class SearchConfig:
     fetch_max_chars_pdf: int = 0  # 0 = unlimited
     fetch_max_bytes: int = 20 * 1024 * 1024  # 20 MB
 
+    # ── Proxy ──
+    # Explicit proxy URL (e.g. 'http://10.0.0.1:8080'). A host that resolves a
+    # proxy from its own Settings (e.g. chatui) injects it here; when empty the
+    # standard https_proxy / http_proxy / all_proxy env vars are used instead.
+    proxy_url: str = ''
+    # When a proxy IS available, try BOTH network paths (proxied ↔ direct) per
+    # engine and remember which one worked (see search/proxy_mode.py). This is
+    # why "search works on one machine but not another" — a container behind a
+    # proxy with no env var, or a host with a stale/dead proxy env var, or a
+    # soft-blocked egress IP. With no proxy configured this is a no-op (single
+    # direct attempt). Set False to force one attempt on the proxy path only.
+    proxy_dual_attempt: bool = True
+
     # ── Security ──
     # Block fetches whose host resolves to a private / loopback / link-local /
     # reserved address (SSRF guard). Applies to the initial URL *and* every
@@ -75,6 +88,17 @@ class SearchConfig:
     filter_min_chars: int = 3000
     filter_timeout: int = 300
 
+    # ── Pre-fetch relevance gate ──
+    # A cheap, no-LLM lexical check (title+snippet vs query terms) that runs
+    # BEFORE a result is fetched, so obviously off-topic SERP junk (e.g. a
+    # health page returned for an academic query) is never fetched. Fail-open
+    # by design — see search/prefetch_gate.py.
+    prefetch_gate_enabled: bool = True
+    # Below this many meaningful query terms the gate is a no-op (fetch all).
+    prefetch_gate_min_query_terms: int = 2
+    # Always fetch at least this many leading candidates (recall floor).
+    prefetch_gate_min_fetch: int = 3
+
     def has_llm(self) -> bool:
         """Return True if an LLM is configured (either callable or API key)."""
         return bool(self.llm_function) or bool(self.llm_api_key)
@@ -114,6 +138,9 @@ def configure(**kwargs) -> SearchConfig:
     """
     global _global_config
     with _lock:
+        def _as_bool(v: str) -> bool:
+            return v.strip().lower() in ('1', 'true', 'yes', 'on')
+
         # Also support env var overrides
         env_mapping = {
             'FETCH_TOP_N': ('fetch_top_n', int),
@@ -122,6 +149,8 @@ def configure(**kwargs) -> SearchConfig:
             'FETCH_MAX_CHARS_DIRECT': ('fetch_max_chars_direct', int),
             'FETCH_MAX_CHARS_PDF': ('fetch_max_chars_pdf', int),
             'FETCH_MAX_BYTES': ('fetch_max_bytes', int),
+            'TOFU_SEARCH_PROXY_URL': ('proxy_url', str),
+            'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
         }
 
         # Apply env var defaults (only for fields not explicitly set by user)

@@ -22,6 +22,11 @@ stays dependency-free when used standalone.
 - **Content deduplication**: Jaccard similarity on shingles (CJK + Latin aware).
 - **Concurrent page fetching**: Race-to-N strategy with SSL fallback + a
   per-domain circuit breaker.
+- **Adaptive proxy strategy**: when a proxy is available each engine tries
+  BOTH network paths (proxied ↔ direct) and remembers which one worked, so a
+  container without a proxy env var, a host with a stale/dead proxy, or a
+  soft-blocked egress IP no longer silently returns "no matches". A no-op
+  (single direct attempt) when no proxy is configured.
 - **One-hop deepening** *(opt-in)*: follow the best query-relevant outbound
   links one hop deeper, bounded like a crawl budget.
 - **LLM content filter** *(optional)*: relevance verdict + noise removal. When
@@ -180,6 +185,10 @@ configure(
     # Filter settings
     filter_enabled=True,           # Enable/disable LLM filter
     filter_min_chars=3000,         # Min chars to trigger LLM filter
+
+    # Proxy (adaptive dual-attempt)
+    proxy_url="",                  # Explicit proxy; empty ⇒ use env vars
+    proxy_dual_attempt=True,       # Try proxied ↔ direct + learn which works
 )
 ```
 
@@ -187,7 +196,10 @@ Many settings also read from environment variables: `FETCH_TOP_N`,
 `FETCH_TIMEOUT`, `FETCH_MAX_CHARS_SEARCH`, `FETCH_MAX_CHARS_DIRECT`,
 `FETCH_MAX_CHARS_PDF`, `FETCH_MAX_BYTES`. One-hop deepening is enabled with
 `SEARCH_DEEPEN_HOPS=1` (or per call: `perform_web_search(..., deepen=True)`).
-Semantic Scholar raises its rate limit with `SEMANTIC_SCHOLAR_API_KEY`.
+Semantic Scholar raises its rate limit with `SEMANTIC_SCHOLAR_API_KEY`. The
+adaptive proxy honours `TOFU_SEARCH_PROXY_URL` and
+`TOFU_SEARCH_PROXY_DUAL_ATTEMPT` (plus the standard `https_proxy` /
+`http_proxy` / `all_proxy`).
 
 ## Pipeline
 
@@ -195,7 +207,9 @@ Semantic Scholar raises its rate limit with `SEMANTIC_SCHOLAR_API_KEY`.
 
 1. **Multi-engine search**: engines fire in parallel; each engine's URLs are
    deduped and submitted to the fetch pool the moment they arrive (the first
-   page fetch starts before slow engines finish).
+   page fetch starts before slow engines finish). When a proxy is configured
+   each engine adaptively tries both the proxied and direct network path and
+   learns which one works (see the adaptive-proxy feature above).
 2. **URL dedup**: scheme/trailing-slash-insensitive keys.
 3. **Content dedup**: Jaccard similarity on title+snippet shingles.
 4. **Page fetch**: concurrent HTTP with race-to-N; SSL retry, circuit breaker,

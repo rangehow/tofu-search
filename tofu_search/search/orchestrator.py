@@ -2,10 +2,13 @@
 
 Pipeline order (cheap → expensive):
   1+4 MERGED: engines fire in parallel; as each engine returns results,
-      URLs are immediately deduped and submitted to the fetch pool. Page
+      URLs are immediately deduped, passed through a cheap pre-fetch
+      relevance gate, and the survivors submitted to the fetch pool. Page
       fetching starts as soon as the FIRST engine responds, overlapping
       with slower engines.
   2. URL dedup — runs incrementally as each engine batch arrives.
+  2b. Pre-fetch gate — drop the FETCH of results with zero query-term overlap
+      (off-topic SERP junk), fail-open, no LLM. See search/prefetch_gate.py.
   3. Content dedup (Jaccard on title+snippet shingles) — once after engines.
   5. LLM content filter — relevance verdict + noise removal (if LLM configured).
   6. BM25 rerank — on cleaned full text → top-N (pure Python, no API call).
@@ -29,6 +32,7 @@ from tofu_search.search.engines.ddg import search_ddg_api, search_ddg_html
 from tofu_search.search.engines.marginalia import search_marginalia
 from tofu_search.search.engines.searxng import search_searxng
 from tofu_search.search.engines.xhs import search_xhs, xhs_search_available
+from tofu_search.search.prefetch_gate import partition_fetchable
 from tofu_search.search.rerank import rerank_by_bm25
 
 logger = get_logger(__name__)
@@ -122,6 +126,11 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     max_chars = max_chars_per_page if max_chars_per_page else config.fetch_max_chars_search
     pdf_max_chars = config.fetch_max_chars_pdf
 
+    # Pre-fetch relevance gate knobs (resolved once; read in the batch callback).
+    gate_enabled = getattr(config, 'prefetch_gate_enabled', True)
+    gate_min_terms = getattr(config, 'prefetch_gate_min_query_terms', 2)
+    gate_min_fetch = getattr(config, 'prefetch_gate_min_fetch', 3)
+
     fetch_pool = ThreadPoolExecutor(max_workers=16)
     first_fetch_submitted_at = None
 
@@ -141,6 +150,25 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         if not new_results or not fetch_pages:
             return
 
+        # ── Pre-fetch relevance gate ──
+        # Decline to fetch results that share ZERO query terms with the query
+        # (obvious SERP junk), so off-topic pages never cost a fetch / never
+        # flood a host's browser transport. Fail-open: short queries and the
+        # leading `min_fetch` candidates always pass. Skipped results stay in
+        # `unique_results` as snippet-only candidates (added above), so rerank
+        # still sees them — we only skip the page FETCH, not the result.
+        if gate_enabled:
+            to_fetch, _skipped = partition_fetchable(
+                query, new_results,
+                min_query_terms=gate_min_terms,
+                min_fetch=gate_min_fetch,
+            )
+        else:
+            to_fetch = new_results
+
+        if not to_fetch:
+            return
+
         def _do_fetch(result_dict):
             url = result_dict['url']
             t0 = time.time()
@@ -149,7 +177,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
             return result_dict, content, elapsed
 
         with _lock:
-            for r in new_results:
+            for r in to_fetch:
                 fut = fetch_pool.submit(_do_fetch, r)
                 fetch_futs[fut] = r
             if first_fetch_submitted_at is None:

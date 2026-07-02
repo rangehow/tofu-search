@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tofu-search"
-version = "0.3.0"
+version = "0.4.1"
 description = "Multi-engine web search, vertical lookups, and content fetching with optional LLM filtering — standalone library from the Tofu AI assistant"
 readme = "README.md"
 license = {text = "MIT"}

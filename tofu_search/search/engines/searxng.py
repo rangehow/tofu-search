@@ -12,6 +12,7 @@ from tofu_search.search._common import (
     search_session,
     soup_of,
 )
+from tofu_search.search.proxy_mode import proxy_mode_manager
 
 logger = get_logger(__name__)
 
@@ -67,10 +68,17 @@ def search_searxng(query, max_results=6, freshness=''):
     """
     import time as _time
     t0 = _time.time()
-    shuffled = list(get_config().searxng_instances)
+    cfg = get_config()
+    shuffled = list(cfg.searxng_instances)
     random.shuffle(shuffled)
     _TIMEOUT = 2  # seconds — if SearXNG can't respond in 2s, it won't
     _MAX_INSTANCES = 2  # try at most 2 instances (was 3)
+    # Resolve the preferred network path once (honours an explicit
+    # config.proxy_url / the DIRECT env-bypass marker). SearXNG's own per-
+    # instance rotation already provides path diversity, so we take just the
+    # first planned attempt rather than looping both paths per instance.
+    _proxies = proxy_mode_manager.attempt_plan('SearXNG', cfg)[0][1]
+    _pkw = {'proxies': _proxies} if _proxies is not None else {}
     # SearXNG supports time_range param: day, week, month, year
     _FRESHNESS_MAP = {'day': 'day', 'week': 'week', 'month': 'month', 'year': 'year'}
     time_range = _FRESHNESS_MAP.get(freshness, '')
@@ -85,6 +93,7 @@ def search_searxng(query, max_results=6, freshness=''):
                 f'{inst}/search',
                 params=json_params,
                 headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
+                **_pkw,
             )
 
             # 302/301 → homepage redirect = bot block, skip immediately
@@ -114,6 +123,7 @@ def search_searxng(query, max_results=6, freshness=''):
                     f'{inst}/search',
                     params=html_params,
                     headers=HEADERS, timeout=_TIMEOUT, allow_redirects=False,
+                    **_pkw,
                 )
                 # Detect redirect again
                 if resp.status_code in (301, 302):

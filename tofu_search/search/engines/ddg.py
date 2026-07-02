@@ -7,7 +7,54 @@ from tofu_search.search._common import clean_text, http_search_get, make_result,
 
 logger = get_logger(__name__)
 
-__all__ = ['search_ddg_html', 'search_ddg_api']
+__all__ = ['search_ddg_html', 'search_ddg_api', 'parse_ddg_html_text']
+
+
+def parse_ddg_html_text(html: str, *, max_results: int | None = None,
+                        source: str = 'DuckDuckGo') -> list[dict]:
+    """Parse a raw DuckDuckGo lite HTML string into result dicts.
+
+    Shares the exact bs4 selector logic of the in-engine parser, but accepts
+    a plain HTML string instead of a ``requests`` response — so a host that
+    fetched the SERP through a browser (see
+    :func:`tofu_search.search.browser_fallback.search_via_browser`) gets the
+    same parsing quality as the server-side engine, without re-implementing it.
+
+    Args:
+        html: Raw HTML of an ``html.duckduckgo.com/html/`` results page.
+        max_results: Cap on the number of results returned (None ⇒ no cap).
+        source: ``source`` field stamped on each result dict.
+
+    Returns:
+        List of ``{title, snippet, url, source}`` dicts (possibly empty).
+    """
+    results = []
+    soup = soup_of(html or '')
+    for a in soup.select('a.result__a[href]'):
+        if max_results is not None and len(results) >= max_results:
+            break
+        raw_url = a['href']
+        if '/y.js?' in raw_url and 'ad_' in raw_url:
+            continue
+        url = raw_url
+        if 'uddg=' in raw_url:
+            try:
+                url = unquote(parse_qs(urlparse(raw_url).query).get('uddg', [raw_url])[0])
+            except Exception as e:
+                logger.debug('[Search] uddg URL decode failed: %s (%s)', raw_url[:100], e)
+        if raw_url.startswith('//'):
+            url = 'https:' + url if url.startswith('//') else url
+        if not url.startswith('http'):
+            continue
+        title = a.get_text(' ', strip=True)
+        snippet = ''
+        block = a.find_parent(class_='result')
+        if block:
+            snip = block.select_one('.result__snippet')
+            if snip:
+                snippet = snip.get_text(' ', strip=True)
+        results.append(make_result(title, snippet, url, source))
+    return results
 
 
 def _parse_ddg_html(resp):

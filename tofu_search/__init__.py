@@ -32,7 +32,7 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.3.0'
+__version__ = '0.4.1'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
@@ -56,6 +56,14 @@ from tofu_search.search.vertical import (
     search_vertical,
     search_vertical_domain,
 )
+from tofu_search.verify import (
+    parse_bibtex,
+    parse_references,
+    summarize,
+    verify_bibtex,
+    verify_citations,
+    verify_references,
+)
 
 __all__ = [
     'search',
@@ -75,6 +83,13 @@ __all__ = [
     'search_vertical',
     'search_vertical_domain',
     'list_domains',
+    # Citation verification (reference hallucination detection)
+    'verify_bibtex',
+    'verify_references',
+    'verify_citations',
+    'parse_bibtex',
+    'parse_references',
+    'summarize',
     # Provider seams (host integration)
     'BrowserProvider',
     'AuthSourceProvider',

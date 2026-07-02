@@ -628,7 +628,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)  # 宽裕超时
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright worker timeout — %s', url[:80], exc_info=True)
+            logger.warning('🎭 Playwright worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
     def fetch_authenticated(self, url, cookies, proxy='', timeout=25, max_chars=None):
@@ -646,7 +646,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright auth worker timeout — %s', url[:80], exc_info=True)
+            logger.warning('🎭 Playwright auth worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
     def search_authenticated(self, url, cookies, proxy='', timeout=20,
@@ -666,7 +666,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright auth-search worker timeout — %s', url[:80], exc_info=True)
+            logger.warning('🎭 Playwright auth-search worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
 

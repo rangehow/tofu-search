@@ -43,6 +43,17 @@ def stub_engines(monkeypatch):
                         lambda url, **kw: "x" * 500)
     # Disable deepen.
     monkeypatch.setattr(orchestrator, "is_deepen_enabled", lambda: False)
+    # Disable the pre-fetch relevance gate — this fixture's synthetic results
+    # use index-derived unique tokens with zero query overlap by design (to
+    # keep content-dedup from collapsing them), which the gate would otherwise
+    # correctly skip. These tests target the Race-to-N fetch accounting, an
+    # orthogonal concern, so they need every result fetched. Restore the global
+    # afterwards so the toggle doesn't leak into other tests.
+    from tofu_search.config import configure, get_config
+    _prev_gate = get_config().prefetch_gate_enabled
+    configure(prefetch_gate_enabled=False)
+    yield
+    configure(prefetch_gate_enabled=_prev_gate)
 
 
 def test_pipeline_returns_content_results(stub_engines):

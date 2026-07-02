@@ -24,7 +24,9 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from tofu_search.config import get_config
 from tofu_search.log import get_logger
+from tofu_search.search.proxy_mode import proxy_mode_manager
 
 logger = get_logger(__name__)
 
@@ -32,6 +34,40 @@ __all__ = [
     'HEADERS', 'clean_text', 'http_search_get',
     'soup_of', 'make_result', 'search_session', 'engine_circuit',
 ]
+
+# A 200 response whose body is at least this large but parses to ZERO result
+# blocks is treated as a soft block (consent wall / bot interstitial / locale
+# redirect served 200), NOT a genuine "no matches" — worth retrying the other
+# network path when a proxy is available. Matches the per-engine parse-health
+# threshold used by the Bing/Brave parsers.
+_SOFT_BLOCK_BODY_BYTES = 20_000
+
+
+def _is_connection_failure(exc: Exception) -> bool:
+    """True for connect/proxy/DNS-level failures worth retrying the OTHER path.
+
+    A read-timeout (the endpoint accepted the connection but couldn't answer in
+    time) is deliberately EXCLUDED — switching network path won't make a slow
+    endpoint fast, and a full second attempt would blow the time budget.
+    """
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return False
+    # ConnectionError covers DNS failure, connection refused/reset — but
+    # ConnectTimeout (already handled) also subclasses it, so this is the
+    # residual "couldn't establish the connection" bucket.
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    return False
+
+
+# Blocking HTTP statuses that justify retrying the other network path: a proxy
+# auth demand (407), an egress-IP block (403), rate-limit (429), or a 5xx that
+# is often an interstitial served by a blocking edge.
+_RETRYABLE_STATUSES = frozenset({403, 407, 429, 500, 502, 503, 504})
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -204,35 +240,80 @@ def http_search_get(
         logger.info('%s skipped (circuit open) query=%r', tag, query[:60])
         return []
 
+    hdrs = headers or HEADERS
+
+    def _get(proxies_kwarg):
+        kw = {'params': params, 'headers': hdrs, 'timeout': timeout}
+        if proxies_kwarg is not None:
+            kw['proxies'] = proxies_kwarg
+        return search_session.get(url, **kw)
+
+    # ── Adaptive proxy plan: one attempt when no proxy is configured (identical
+    #    to the historical env-only path), else BOTH network paths in
+    #    sticky-learned order. See search/proxy_mode.py. ──
+    plan = proxy_mode_manager.attempt_plan(name, get_config())
+
     t0 = time.time()
-    failed = False
-    try:
-        resp = search_session.get(url, params=params, headers=headers or HEADERS, timeout=timeout)
+    results: list = []
+    failed = True   # until an attempt genuinely succeeds
 
-        # Rate-limit retry (DDG-specific, opt-in)
-        if on_ratelimit_retry and resp.status_code == 202:
-            logger.info('%s 202 (rate-limited), retry in 0.6s: %s', tag, query[:80])
-            time.sleep(0.6)
-            resp = search_session.get(url, params=params, headers=headers or HEADERS, timeout=timeout)
+    for idx, (mode, proxies_kwarg) in enumerate(plan):
+        is_last = idx == len(plan) - 1
+        try:
+            resp = _get(proxies_kwarg)
 
-        if not resp.ok:
-            logger.warning('%s returned HTTP %d for query: %s', tag, resp.status_code, query[:80])
-            engine_circuit.record_failure(name)
-            return []
+            # Rate-limit retry (DDG-specific, opt-in) — same network path.
+            if on_ratelimit_retry and resp.status_code == 202:
+                logger.info('%s 202 (rate-limited), retry in 0.6s: %s', tag, query[:80])
+                time.sleep(0.6)
+                resp = _get(proxies_kwarg)
 
-        results = parser(resp) or []
-        if len(results) > max_results:
-            results = results[:max_results]
+            if not resp.ok:
+                # A blocking status (proxy-auth / egress-IP block / rate-limit /
+                # 5xx interstitial) is worth trying the other network path.
+                if not is_last and resp.status_code in _RETRYABLE_STATUSES:
+                    logger.info('%s HTTP %d via %s — retrying alternate network path',
+                                tag, resp.status_code, mode)
+                    proxy_mode_manager.record_failure(name, mode)
+                    continue
+                logger.warning('%s returned HTTP %d via %s for query: %s',
+                               tag, resp.status_code, mode, query[:80])
+                break
 
-    except requests.Timeout:
-        logger.warning('%s timeout for query: %s', tag, query[:80])
-        results, failed = [], True
-    except requests.RequestException as e:
-        logger.warning('%s request failed for query %r: %s', tag, query[:80], e)
-        results, failed = [], True
-    except Exception as e:
-        logger.error('%s error: %s', tag, e, exc_info=True)
-        results, failed = [], True
+            results = parser(resp) or []
+            if len(results) > max_results:
+                results = results[:max_results]
+
+            # Soft block: a substantial 200 body that parses to ZERO results is
+            # a consent wall / bot interstitial / locale redirect served 200,
+            # not a genuine "no matches" — retry the other path if we have one.
+            if (not results and not is_last
+                    and len(getattr(resp, 'text', '') or '') > _SOFT_BLOCK_BODY_BYTES):
+                logger.info('%s 200 but parsed 0 results (%d bytes) via %s — '
+                            'likely soft block, retrying alternate network path',
+                            tag, len(resp.text), mode)
+                proxy_mode_manager.record_failure(name, mode)
+                continue
+
+            # Genuine success (even 0 matches on a small body = real no-match).
+            failed = False
+            proxy_mode_manager.record_success(name, mode)
+            break
+
+        except requests.RequestException as e:
+            if not is_last and _is_connection_failure(e):
+                logger.info('%s connect failure via %s (%s) — retrying alternate network path',
+                            tag, mode, type(e).__name__)
+                proxy_mode_manager.record_failure(name, mode)
+                continue
+            if isinstance(e, requests.Timeout):
+                logger.warning('%s timeout via %s for query: %s', tag, mode, query[:80])
+            else:
+                logger.warning('%s request failed via %s for query %r: %s', tag, mode, query[:80], e)
+            break
+        except Exception as e:
+            logger.error('%s error via %s: %s', tag, mode, e, exc_info=True)
+            break
 
     if failed:
         engine_circuit.record_failure(name)

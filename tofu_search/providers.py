@@ -54,8 +54,29 @@ class BrowserProvider:
         """Fetch ``url`` through the host browser; return extracted text or None."""
         return None
 
+    def fetch_html(self, url: str, *, timeout: int = 20) -> Optional[str]:
+        """Fetch the RAW HTML of ``url`` through the host browser.
+
+        Unlike :meth:`fetch_url` (which returns host-extracted *text*), this
+        returns the unparsed HTML so the library can run its own engine-grade
+        parser on it. Used by :func:`tofu_search.search.browser_fallback` to
+        scrape a search-results page through the user's browser while keeping
+        the parsing logic inside the library (not duplicated in the host).
+
+        Default returns None — hosts that can't supply raw HTML simply don't
+        unlock the browser search fallback. Returning None makes
+        ``search_via_browser`` fall back to the host's own :meth:`search`.
+        """
+        return None
+
     def search(self, query: str, *, max_results: int = 8) -> list[dict]:
-        """Run a web search through the host browser; return result dicts or []."""
+        """Run a web search through the host browser; return result dicts or [].
+
+        This is the LAST-resort hook: it asks the host to perform the entire
+        search (fetch + parse). Prefer implementing :meth:`fetch_html` instead,
+        which lets the library own the result parsing. ``search_via_browser``
+        only calls this when :meth:`fetch_html` returns None.
+        """
         return []
 
 
