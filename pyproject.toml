@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tofu-search"
-version = "0.4.1"
+version = "0.4.2"
 description = "Multi-engine web search, vertical lookups, and content fetching with optional LLM filtering — standalone library from the Tofu AI assistant"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,6 +28,13 @@ dependencies = [
     "beautifulsoup4>=4.13.4",
     "python-dateutil>=2.8",
     "urllib3>=2.5",
+    # lxml is a TRANSITIVE dep of trafilatura, NOT imported by tofu_search
+    # directly. All BeautifulSoup parsing in this package uses 'html.parser'
+    # (see search/_common.py:soup_of) — lxml 6.x/libxml2 can segfault under
+    # concurrent threads, so the only lxml consumer (trafilatura.extract) is
+    # serialized under _TRAFILATURA_LOCK in fetch/html_extract.py. Pinned here
+    # with a floor >=5.3 to keep a known-good version resolved; do NOT switch
+    # any bs4 construction to the 'lxml' parser.
     "lxml>=5.3",
 ]
 

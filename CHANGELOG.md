@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2
+
+### Changed
+- **Docs/packaging hygiene only — no behavioural change.** Documented in
+  `pyproject.toml` that `lxml` is a *transitive* dependency of `trafilatura`,
+  NOT imported by `tofu_search` directly: all BeautifulSoup parsing uses the
+  `html.parser` backend (`search/_common.py:soup_of`) because lxml 6.x/libxml2
+  can segfault under concurrent threads, and the sole lxml consumer
+  (`trafilatura.extract`) is already serialized under `_TRAFILATURA_LOCK` in
+  `fetch/html_extract.py`. The `lxml>=5.3` floor is retained to keep a
+  known-good version resolved. This is a clarifying comment so future
+  contributors do not switch any bs4 construction to the `lxml` parser.
+
 ## 0.4.1
 
 ### Added
