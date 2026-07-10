@@ -5,10 +5,12 @@ summary-only tier.  Irrelevant pages are stripped upstream (executor) and
 never reach this formatter.
 """
 
+from tofu_search.search.authority import authority_label
+
 __all__ = ['format_search_for_tool_response']
 
 
-def format_search_for_tool_response(results, search_diag=None):
+def format_search_for_tool_response(results, search_diag=None, query=''):
     """格式化搜索结果给模型 — 全量输出。
 
     All results that have ``full_content`` get the complete text included.
@@ -42,6 +44,10 @@ def format_search_for_tool_response(results, search_diag=None):
         entry = (f"[{i}] {r['title']}\n"
                  f"    URL: {r['url']}\n"
                  f"    Source: {r['source']}")
+
+        _auth = authority_label(r.get('url') or '', query)
+        if _auth:
+            entry += f"\n    Authority: {_auth}"
 
         if r.get('full_content'):
             # Always include full content — no cap, no preview/summary tier

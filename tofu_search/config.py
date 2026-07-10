@@ -29,6 +29,25 @@ class SearchConfig:
     fetch_max_chars_pdf: int = 0  # 0 = unlimited
     fetch_max_bytes: int = 20 * 1024 * 1024  # 20 MB
 
+    # ── Wall-clock deadlines (robustness against wedged/dead hosts) ──
+    # Total budget for ONE perform_web_search() call. When exceeded, the
+    # pipeline force-returns whatever it has gathered so far (partial results +
+    # a ``_deadline_hit`` marker) instead of blocking on slow hosts: it caps the
+    # fetch-wait loop and short-circuits the LLM-filter / deepen / rerank stages.
+    # The ONLY prior caps were a 20s engine timeout and a 90s fetch timeout, and
+    # the 90s only exits early once ``kept_ok >= target_ok`` — a count a
+    # niche-domain query never reaches, so it hung the full 90s (and then some).
+    # 0 disables the cap (legacy unbounded behaviour). Env: TOFU_SEARCH_DEADLINE_SECS.
+    search_deadline_secs: int = 45
+    # Total budget for ONE fetch_page_content() URL, bounding the whole fallback
+    # chain (HTTP body-download + browser + Playwright) so a single dead host
+    # can't stack per-hop timeouts (do_request body deadline is timeout*3=45s,
+    # then a 15-25s browser fallback, then a 15s Playwright render) into 60s+.
+    # Soft bound: it clamps the HTTP hop and SKIPS any further fallback once the
+    # budget is blown, so worst case ≈ deadline + one in-flight hop.
+    # 0 disables the cap. Env: TOFU_SEARCH_FETCH_URL_DEADLINE_SECS.
+    fetch_url_deadline_secs: int = 25
+
     # ── Proxy ──
     # Explicit proxy URL (e.g. 'http://10.0.0.1:8080'). A host that resolves a
     # proxy from its own Settings (e.g. chatui) injects it here; when empty the
@@ -149,6 +168,8 @@ def configure(**kwargs) -> SearchConfig:
             'FETCH_MAX_CHARS_DIRECT': ('fetch_max_chars_direct', int),
             'FETCH_MAX_CHARS_PDF': ('fetch_max_chars_pdf', int),
             'FETCH_MAX_BYTES': ('fetch_max_bytes', int),
+            'TOFU_SEARCH_DEADLINE_SECS': ('search_deadline_secs', int),
+            'TOFU_SEARCH_FETCH_URL_DEADLINE_SECS': ('fetch_url_deadline_secs', int),
             'TOFU_SEARCH_PROXY_URL': ('proxy_url', str),
             'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
         }

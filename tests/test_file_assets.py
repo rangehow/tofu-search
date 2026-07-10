@@ -15,8 +15,7 @@ import pytest
 
 import tofu_search.fetch.core as core
 import tofu_search.fetch.utils as utils
-from tofu_search import (configure, fetch_page_content, fetch_url_bytes,
-                         looks_like_text_asset)
+from tofu_search import configure, fetch_page_content, fetch_url_bytes, looks_like_text_asset
 
 
 class _FakeResp:
@@ -64,7 +63,7 @@ def test_fetch_page_content_returns_svg_source(monkeypatch):
     svg = '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h24v24H0z"/></svg>' * 3
     monkeypatch.setattr(utils, '_host_is_safe', lambda h: True)
     monkeypatch.setattr(core, '_do_request',
-                        lambda url, timeout, verify=True, legacy_ssl=False:
+                        lambda url, timeout, verify=True, legacy_ssl=False, deadline_ts=None:
                         (_FakeResp('image/svg+xml'), svg.encode('utf-8')))
     out = fetch_page_content('https://cdn.example.com/icon.svg')
     assert out is not None
@@ -77,7 +76,7 @@ def test_fetch_page_content_returns_json_source(monkeypatch):
     body = '{"name": "tofu", "nested": {"a": [1, 2, 3]}}'
     monkeypatch.setattr(utils, '_host_is_safe', lambda h: True)
     monkeypatch.setattr(core, '_do_request',
-                        lambda url, timeout, verify=True, legacy_ssl=False:
+                        lambda url, timeout, verify=True, legacy_ssl=False, deadline_ts=None:
                         (_FakeResp('application/json'), body.encode('utf-8')))
     out = fetch_page_content('https://api.example.com/data.json')
     assert out == body
@@ -90,7 +89,7 @@ def test_fetch_url_bytes_returns_bytes_and_ct(monkeypatch):
     raw = b'\x89PNG\r\n\x1a\n' + b'\x00' * 100
     monkeypatch.setattr(utils, '_host_is_safe', lambda h: True)
     monkeypatch.setattr(core, '_do_request',
-                        lambda url, timeout, verify=True, legacy_ssl=False:
+                        lambda url, timeout, verify=True, legacy_ssl=False, deadline_ts=None:
                         (_FakeResp('image/png'), raw))
     got = fetch_url_bytes('https://cdn.example.com/logo.png')
     assert got is not None
@@ -117,7 +116,7 @@ def test_fetch_url_bytes_size_cap(monkeypatch):
     configure(block_private_addresses=False)
     monkeypatch.setattr(utils, '_host_is_safe', lambda h: True)
     monkeypatch.setattr(core, '_do_request',
-                        lambda url, timeout, verify=True, legacy_ssl=False:
+                        lambda url, timeout, verify=True, legacy_ssl=False, deadline_ts=None:
                         (_FakeResp('application/zip'), b'X' * 5000))
     assert fetch_url_bytes('https://cdn.example.com/big.zip', max_bytes=1000) is None
 

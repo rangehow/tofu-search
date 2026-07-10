@@ -72,10 +72,16 @@ class HttpError(Exception):
         super().__init__(f'HTTP {status_code} for {url[:120]}')
 
 
-def do_request(url, timeout, verify=True, legacy_ssl=False):
+def do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
     """Execute a single GET request, return (resp, raw_bytes) or raise.
 
     Non-2xx responses raise HttpError so the caller can branch on status.
+
+    Args:
+        deadline_ts: Optional absolute ``time.time()`` deadline that bounds the
+            body-download loop. The internal ``timeout*3`` wall-time cap is
+            reduced to whichever comes first, so a caller enforcing a per-URL
+            budget can stop a slow trickle-download early.
     """
     cfg = get_config()
     if legacy_ssl and _HAS_LEGACY_SSL:
@@ -101,6 +107,9 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
         resp.close()
         raise HttpError(413, url)   # treat as "too large"
     total_deadline = timeout * 3
+    _body_stop = t0 + total_deadline
+    if deadline_ts is not None:
+        _body_stop = min(_body_stop, deadline_ts)
     chunks, dl = [], 0
     oversized = False
     try:
@@ -109,8 +118,9 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
             if dl > cfg.fetch_max_bytes:
                 oversized = True
                 break
-            if time.time() - t0 > total_deadline:
-                logger.warning('Download exceeded %ss wall time — %s', total_deadline, url[:80])
+            if time.time() > _body_stop:
+                logger.warning('Download exceeded wall time (%.0fs budget) — %s',
+                               _body_stop - t0, url[:80])
                 break
     except _requests_mod.exceptions.ContentDecodingError as e:
         resp.close()
@@ -132,7 +142,7 @@ def do_request(url, timeout, verify=True, legacy_ssl=False):
                 if dl > cfg.fetch_max_bytes:
                     oversized = True
                     break
-                if time.time() - t0 > total_deadline:
+                if time.time() > _body_stop:
                     break
         finally:
             resp2.close()

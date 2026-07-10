@@ -24,6 +24,7 @@ from tofu_search.fetch.http import try_authenticated_fetch as _try_authenticated
 from tofu_search.fetch.http import try_browser_fetch as _try_browser_fetch
 from tofu_search.fetch.http import try_playwright_fallback as _try_playwright_fallback
 from tofu_search.fetch.pdf_extract import extract_pdf_text as _extract_pdf_text
+from tofu_search.fetch.readers import get_reader as _get_reader
 from tofu_search.fetch.utils import (
     _CACHE_EXTRACT_LIMIT,
     _HAS_LEGACY_SSL,
@@ -62,14 +63,58 @@ __all__ = [
 #  Core fetch
 # ═══════════════════════════════════════════════════════
 
-def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
+def _mk_deadline_browser(budget_blown):
+    """Wrap the module browser fallback so it's skipped once the URL budget is blown."""
+    def _wrapped(url, max_chars, reason='unknown'):
+        if budget_blown():
+            logger.info('[Fetch] ⏱ skip browser fallback (per-URL deadline) — %s', url[:80])
+            return None
+        return _try_browser_fetch(url, max_chars, reason=reason)
+    return _wrapped
+
+
+def _mk_deadline_playwright(budget_blown):
+    """Wrap the module Playwright fallback so it's skipped once the URL budget is blown."""
+    def _wrapped(url, max_chars, timeout):
+        if budget_blown():
+            logger.info('[Fetch] ⏱ skip Playwright fallback (per-URL deadline) — %s', url[:80])
+            return None
+        return _try_playwright_fallback(url, max_chars, timeout)
+    return _wrapped
+
+
+def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
+                       deadline_secs=None):
     cfg = get_config()
     if max_chars is None: max_chars = cfg.fetch_max_chars_search
     if pdf_max_chars is None: pdf_max_chars = cfg.fetch_max_chars_pdf
     if timeout is None: timeout = cfg.fetch_timeout
+
+    # ── Per-URL total-time cap (0 = disabled) ──
+    # Bounds the WHOLE fallback chain for one URL — the primary HTTP
+    # body-download (via deadline_ts below) PLUS the browser and Playwright
+    # fallbacks — so a single dead/slow host can't stack per-hop timeouts
+    # (body ≈ timeout*3, +browser ≈ 15-25s, +Playwright ≈ 15s) into 60s+.
+    # Once the budget is blown we skip any REMAINING fallback hop rather than
+    # hard-killing an in-flight one, so worst case ≈ deadline + one hop.
+    if deadline_secs is None:
+        deadline_secs = getattr(cfg, 'fetch_url_deadline_secs', 0) or 0
+    _url_t0 = time.time()
+    _url_deadline_ts = (_url_t0 + deadline_secs) if deadline_secs > 0 else None
+
+    def _url_budget_blown():
+        return _url_deadline_ts is not None and time.time() >= _url_deadline_ts
+
+    # Shadow the two expensive fallback helpers with deadline-aware wrappers.
+    # A local assignment makes each name local for the ENTIRE function body, so
+    # every call site below is gated by the per-URL budget without editing each
+    # one individually. When the budget is blown the hop is skipped (returns
+    # None → the caller falls through to its own "give up" path).
+    _try_browser_fetch = _mk_deadline_browser(_url_budget_blown)
+    _try_playwright_fallback = _mk_deadline_playwright(_url_budget_blown)
+
     # Rewrite code-hosting blob URLs to raw-content URLs (GitHub, GitLab, Bitbucket)
     url = _normalize_code_hosting_url(url)
-    if not _should_fetch(url): return None
     url_is_pdf = url.lower().rstrip('/').endswith('.pdf')
     cached = _fetch_cache.get(url)
     if cached is not None:
@@ -80,10 +125,30 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
 
     domain = urlparse(url).netloc.lower()
 
+    # ── Reader tier (public no-login data endpoints) ──
+    # Runs BEFORE the skip-domain gate so a domain that is blunt-blocked as an
+    # un-fetchable JS/social app (e.g. x.com) can still yield a clean text
+    # block for a *recognized* URL (a tweet/status link) via its public
+    # endpoint. A reader that matches but yields nothing (deleted/not-found)
+    # falls through to the normal skip/fetch policy — the block still applies
+    # to non-recognized URLs on the same domain (a bare x.com/home stays
+    # blocked). Readers reuse the shared HTTP transport; no duplicated request
+    # logic, and this fires for BOTH web_search result-fetching and direct
+    # fetch_url since both enter here.
+    _reader = _get_reader(url)
+    if _reader is not None:
+        reader_text = _reader.read(url, max_chars=max_chars, timeout=timeout)
+        if reader_text:
+            _fetch_cache.put(url, reader_text)
+            return reader_text
+        logger.debug('[Fetch] reader %s matched but yielded nothing, '
+                     'falling through — %s', getattr(_reader, 'name', '?'), url[:80])
+
     # ── Authenticated source (login-walled sites) ──
     # If a host has registered an auth-source provider and the user has
     # connected this domain (cookies), replay their logged-in session via
-    # Playwright. The anonymous paths only ever return the login wall here.
+    # Playwright. Runs BEFORE the skip-domain gate too: a connected domain must
+    # bypass the block (the anonymous paths only ever return the login wall).
     _auth_src = None
     _auth_provider = get_auth_source_provider()
     if _auth_provider is not None:
@@ -101,6 +166,12 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
         logger.info('[Fetch] auth-source fetch yielded nothing, falling back '
                     'to anonymous pipeline — %s', url[:80])
 
+    # ── Skip-domain / SSRF / binary-media / circuit gate ──
+    # After the reader + auth-source bypasses so a connected or reader-handled
+    # URL is not blunt-blocked, but before any anonymous network request.
+    if not _should_fetch(url):
+        return None
+
     # ── Known SPA domains: skip requests, go straight to Playwright ──
     if _is_known_spa(url):
         logger.debug('🎭 Known SPA domain, using Playwright — %s', url[:80])
@@ -111,7 +182,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
     html_for_spa_check = None
 
     try:
-        resp, raw = _do_request(url, timeout, verify=True)
+        resp, raw = _do_request(url, timeout, verify=True, deadline_ts=_url_deadline_ts)
     except _HttpError as e:
         # 401/403/404/410/413 = URL-specific (auth/permission/missing/oversize),
         # not a domain fault → don't trip the circuit breaker.
@@ -138,7 +209,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
         if is_legacy_renegotiation and _HAS_LEGACY_SSL:
             logger.warning('SSL legacy renegotiation error, retrying with legacy adapter — %s', domain, exc_info=True)
             try:
-                resp, raw = _do_request(url, timeout, legacy_ssl=True)
+                resp, raw = _do_request(url, timeout, legacy_ssl=True, deadline_ts=_url_deadline_ts)
             except _HttpError as e2:
                 if e2.status_code not in (401, 403, 404, 406, 410, 413):
                     _circuit.record_failure(url)
@@ -156,7 +227,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None):
             logger.warning('⚠️ SSL failed, retrying WITHOUT certificate verification (insecure) — %s: %s',
                            domain, e, exc_info=True)
             try:
-                resp, raw = _do_request(url, timeout, verify=False)
+                resp, raw = _do_request(url, timeout, verify=False, deadline_ts=_url_deadline_ts)
             except _HttpError as e2:
                 if e2.status_code not in (401, 403, 404, 406, 410, 413):
                     _circuit.record_failure(url)

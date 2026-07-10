@@ -32,7 +32,7 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.4.2'
+__version__ = '0.5.0'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
@@ -41,6 +41,7 @@ from tofu_search.fetch.core import (
     fetch_url_bytes,
     fetch_urls,
 )
+from tofu_search.fetch.readers import SiteReader, register_reader
 from tofu_search.fetch.utils import looks_like_text_asset
 from tofu_search.providers import (
     AuthSourceProvider,
@@ -95,6 +96,9 @@ __all__ = [
     'AuthSourceProvider',
     'register_browser_provider',
     'register_auth_source_provider',
+    # Site-reader tier (public-endpoint handlers, e.g. x.com syndication)
+    'SiteReader',
+    'register_reader',
 ]
 
 

@@ -13,6 +13,12 @@ import re
 import time
 
 from tofu_search.log import get_logger
+from tofu_search.search.authority import (
+    AUTHORITY_BOOST,
+    brand_tokens,
+    classify_authority,
+    host_brand_labels,
+)
 
 logger = get_logger(__name__)
 
@@ -104,6 +110,71 @@ def _build_doc_text(r: dict) -> str:
         return f'{title} {snippet}' if title else snippet
 
 
+def _diversify_by_entity(
+    query: str, scored: list[tuple[float, int, dict]], top_k: int
+) -> list[dict] | None:
+    """Coverage-first selection for multi-entity comparison queries.
+
+    ``scored`` is ``[(score, orig_idx, result)]`` already sorted by descending
+    score (BM25 + authority boost). When the query names ≥2 distinct entities
+    that are actually present in the candidate hosts (e.g. "compare Cloudflare
+    Fastly CloudFront …"), plain top-K can fill every slot from the single
+    highest-scoring entity, leaving the others unrepresented. This guarantees
+    each named entity gets its best candidate into the top-K before remaining
+    slots are filled by global score.
+
+    An "entity" is a query brand token (``brand_tokens``) that matches the
+    non-generic host label of at least one candidate (``host_brand_labels``).
+    Within one entity the candidates are already in global-score order, so the
+    authority boost still decides that entity's winner (official/primary over
+    aggregator). Returns ``None`` — signalling the caller to use the plain
+    global top-K — when the query names fewer than 2 present entities.
+    """
+    entity_toks = brand_tokens(query)
+    if not entity_toks:
+        return None
+
+    present: dict[str, list[int]] = {}
+    covers_at: dict[int, set[str]] = {}
+    for rank, (_score, _idx, result) in enumerate(scored):
+        covered = host_brand_labels(result.get('url') or '') & entity_toks
+        covers_at[rank] = covered
+        for e in covered:
+            present.setdefault(e, []).append(rank)
+
+    if len(present) < 2:
+        return None
+
+    # Prefer entities with the strongest single candidate first, so that when
+    # top_k < #entities we keep the best-supported entities.
+    entity_order = sorted(present, key=lambda e: -scored[present[e][0]][0])
+
+    selected_ranks: list[int] = []
+    chosen: set[int] = set()
+    covered_entities: set[str] = set()
+    for e in entity_order:
+        if len(selected_ranks) >= top_k:
+            break
+        if e in covered_entities:
+            continue
+        for rank in present[e]:  # already in global-score order
+            if rank not in chosen:
+                selected_ranks.append(rank)
+                chosen.add(rank)
+                covered_entities |= covers_at[rank]
+                break
+
+    for rank in range(len(scored)):
+        if len(selected_ranks) >= top_k:
+            break
+        if rank not in chosen:
+            selected_ranks.append(rank)
+            chosen.add(rank)
+
+    selected_ranks.sort()  # present in global-score order (best first)
+    return [scored[r][2] for r in selected_ranks]
+
+
 def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
     """Rerank search results by BM25 score of query vs document content.
 
@@ -169,16 +240,27 @@ def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
             denominator = tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avg_dl)
             score += idf * numerator / denominator
 
+        # Primary-source authority: a modest additive nudge so the vendor's own
+        # domain / official docs outrank SEO aggregators when relevance is
+        # comparable (never large enough to beat a much stronger lexical match).
+        tier = classify_authority(result.get('url') or '', query)
+        score += AUTHORITY_BOOST.get(tier, 0.0)
+
         scored.append((score, i, result))
 
     # Sort by score descending, break ties by original position
     scored.sort(key=lambda x: (-x[0], x[1]))
 
-    selected = [item[2] for item in scored[:top_k]]
+    diversified = _diversify_by_entity(query, scored, top_k)
+    if diversified is not None:
+        selected = diversified
+    else:
+        selected = [item[2] for item in scored[:top_k]]
 
     elapsed = time.time() - t0
     scores_str = ', '.join(f'#{item[1]}:{item[0]:.3f}' for item in scored[:top_k])
-    logger.info('[Rerank] BM25 %d→%d results in %.1fms. Top-%d (idx:score): %s  query=%r',
-                len(results), top_k, elapsed * 1000, top_k, scores_str, query[:60])
+    logger.info('[Rerank] BM25 %d→%d results in %.1fms. div=%s Top-%d (idx:score): %s  query=%r',
+                len(results), top_k, elapsed * 1000, diversified is not None,
+                top_k, scores_str, query[:60])
 
     return selected

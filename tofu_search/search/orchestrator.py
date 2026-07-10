@@ -45,9 +45,11 @@ class SearchResultList(list):
 
     ``_search_diag`` is set when 0 results (reason/detail/engine state).
     ``_engine_breakdown`` maps engine tag → [{url, title}] for raw results.
+    ``_deadline_hit`` is True when the wall-clock budget forced a partial return.
     """
     _search_diag = None
     _engine_breakdown = None
+    _deadline_hit = False
 
 
 def _url_dedup_key(url: str) -> str:
@@ -88,6 +90,20 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     pipeline_t0 = time.time()
     step_timings = {}
+
+    # ── Hard wall-clock deadline for the whole call (0 = disabled) ──
+    # Caps the fetch-wait loop and short-circuits the filter/deepen/rerank
+    # stages so a cluster of dead/slow hosts can't wedge the round. When it
+    # fires we force-return whatever's gathered, tagged with _deadline_hit.
+    _deadline_secs = getattr(config, 'search_deadline_secs', 0) or 0
+    _deadline_ts = (pipeline_t0 + _deadline_secs) if _deadline_secs > 0 else None
+    _deadline_hit = False
+
+    def _budget_left():
+        """Seconds remaining until the deadline (None = uncapped)."""
+        if _deadline_ts is None:
+            return None
+        return _deadline_ts - time.time()
 
     if max_results is None:
         max_results = config.fetch_top_n
@@ -304,8 +320,13 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         # implementation re-scanned all of unique_results on every completion
         # (O(n²)) which both wasted work and was easy to get wrong.
         kept_ok = 0
+        # The wait ceiling is the SMALLER of the legacy 90s fetch cap and the
+        # remaining wall-clock budget — so the deadline bounds this loop even
+        # when Race-to-N can never exit (kept_ok < target_ok on a niche query).
+        _left = _budget_left()
+        _wait_ceiling = 90.0 if _left is None else max(0.0, min(90.0, _left))
         try:
-            for fut in as_completed(pending_futs, timeout=90):
+            for fut in as_completed(pending_futs, timeout=_wait_ceiling):
                 try:
                     result_dict, content, fetch_elapsed = fut.result()
                     url = result_dict['url']
@@ -322,6 +343,19 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                 except Exception as e:
                     logger.warning('[Fetch] fetch thread error: %s', e, exc_info=True)
 
+                # ── Deadline check: force-return partial results ──
+                if _budget_left() is not None and _budget_left() <= 0:
+                    _deadline_hit = True
+                    remaining = [f for f in pending_futs if not f.done()]
+                    logger.warning('[Fetch] ⏱ DEADLINE hit (%ds budget) after %.1fs — '
+                                   'force-returning %d fetched page(s), cancelling %d in-flight. query=%r',
+                                   _deadline_secs,
+                                   time.time() - (first_fetch_submitted_at or step4_t0),
+                                   kept_ok, len(remaining), query[:60])
+                    for f in remaining:
+                        f.cancel()
+                    break
+
                 if kept_ok >= target_ok:
                     remaining = [f for f in pending_futs if not f.done()]
                     if remaining:
@@ -333,15 +367,28 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                             f.cancel()
                         break
         except TimeoutError:
-            logger.warning('[Fetch] as_completed timeout (90s)', exc_info=True)
+            # as_completed hit its ceiling. If that ceiling WAS the deadline
+            # (budget <= the legacy 90s), record it as a deadline hit so the
+            # downstream stages short-circuit and the diag marker is set.
+            if _budget_left() is not None and _budget_left() <= 0:
+                _deadline_hit = True
+                logger.warning('[Fetch] ⏱ DEADLINE hit (%ds budget) at fetch-wait ceiling — '
+                               'force-returning partial results. query=%r', _deadline_secs, query[:60])
+            else:
+                logger.warning('[Fetch] as_completed timeout (%.0fs)', _wait_ceiling, exc_info=True)
 
-    fetch_pool.shutdown(wait=True, cancel_futures=True)
+    # On a deadline hit, do NOT block joining still-running fetch threads —
+    # shutdown(wait=True) would re-introduce the very hang we're bounding.
+    fetch_pool.shutdown(wait=not _deadline_hit, cancel_futures=True)
 
     fetch_count = sum(1 for r in unique_results if r.get('full_content'))
     step_timings['step4_page_fetch'] = time.time() - step4_t0
 
     # ── Step 4b: One-hop link-following (depth) — opt-in ──
     _do_deepen = is_deepen_enabled() if deepen is None else deepen
+    if _deadline_hit and _do_deepen:
+        logger.info('[Search] step4b deepen skipped — deadline hit')
+        _do_deepen = False
     if _do_deepen and fetch_pages and fetch_count:
         step4b_t0 = time.time()
         try:
@@ -374,7 +421,9 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     step5_t0 = time.time()
     irrelevant_urls: set[str] = set()
     _filter_on = config.filter_enabled and config.has_llm()
-    if not filter_pages:
+    if _deadline_hit:
+        logger.info('[Search] step5 LLM-filter skipped — deadline hit (serving unfiltered partial results)')
+    elif not filter_pages:
         logger.debug('[Search] step5 skipped — caller passed filter_pages=False')
     elif not _filter_on:
         logger.debug('[Search] step5 skipped — filter disabled or no LLM configured')
@@ -411,7 +460,9 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     # ── Step 6: BM25 rerank on cleaned full text → top-N ──
     step6_t0 = time.time()
-    if not rerank:
+    if _deadline_hit:
+        logger.debug('[Search] step6 rerank skipped — deadline hit')
+    elif not rerank:
         logger.debug('[Search] step6 skipped — caller passed rerank=False')
     elif len(has_content) > max_results:
         relevant = rerank_by_bm25(query, has_content, max_results)
@@ -457,6 +508,11 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     final_results = SearchResultList(relevant[:max_results])
     final_results._engine_breakdown = engine_breakdown
+    final_results._deadline_hit = _deadline_hit
+    if _deadline_hit:
+        logger.warning('[Search] ⏱ returned PARTIAL results (%d) — wall-clock deadline '
+                       '(%ds) fired, TOTAL=%.1fs. query=%r',
+                       len(final_results), _deadline_secs, pipeline_total, query[:60])
 
     if not final_results:
         total_engines = len(ALL_ENGINE_NAMES)
@@ -477,12 +533,19 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
             reason_detail = (
                 'All search engines responded but found no matching results for this query.'
             )
+        if _deadline_hit:
+            reason = 'deadline'
+            reason_detail = (
+                'The search wall-clock budget (%ds) expired before any page '
+                'could be fetched and cleaned (slow/unreachable hosts).' % _deadline_secs
+            )
         diag = {
             'reason': reason,
             'reason_detail': reason_detail,
             'engine_errors': engine_errors,
             'engine_empty': engine_empty,
             'engine_ok': list(engine_counts.keys()),
+            'deadline_hit': _deadline_hit,
         }
         final_results._search_diag = diag
         logger.warning('[Search] 0 final results — diag: reason=%s errors=%s empty=%s query=%r',

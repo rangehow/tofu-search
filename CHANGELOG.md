@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- **Hard wall-clock deadlines (robustness against wedged/dead hosts).** Two new
+  `SearchConfig` knobs, both env-gated with safe defaults so a single-box
+  install is unchanged (set to 0 to restore the old unbounded behaviour):
+  - `search_deadline_secs` (default 45, env `TOFU_SEARCH_DEADLINE_SECS`) —
+    total budget for one `perform_web_search()`. The ONLY prior caps were a 20s
+    engine `as_completed` and a 90s fetch `as_completed`, and the 90s only
+    short-circuits once `kept_ok >= target_ok` — a count a niche-domain query
+    (mostly paywalled/dead hosts) never reaches, so the call hung the full 90s
+    plus the LLM-filter/deepen/rerank tail. The deadline now bounds the
+    fetch-wait loop (`min(90, budget_left)`), does NOT `shutdown(wait=True)` on
+    a hit (that would re-introduce the hang), and short-circuits the
+    filter/deepen/rerank stages. Force-returns partial results tagged
+    `SearchResultList._deadline_hit=True`; a zero-result deadline sets
+    `_search_diag['reason']='deadline'`. Emits a `[Fetch] ⏱ DEADLINE` /
+    `[Search] ⏱ returned PARTIAL` log line.
+  - `fetch_url_deadline_secs` (default 25, env
+    `TOFU_SEARCH_FETCH_URL_DEADLINE_SECS`) — per-URL cap bounding the WHOLE
+    fallback chain (HTTP body-download via a new `do_request(deadline_ts=…)`
+    arg + browser + Playwright), so one dead host can't stack per-hop timeouts
+    (body ≈ timeout×3, +browser 15-25s, +Playwright 15s) into 60s+. Soft bound:
+    once blown, remaining fallback hops are skipped (not killed mid-flight), so
+    worst case ≈ deadline + one in-flight hop.
+  - Tests: `tests/test_deadline.py` (4) — deadline forces partial return within
+    budget + per-URL cap skips the slow chain, each with a NEUTER-BITE sibling
+    (knob=0 → the call provably exceeds the budget).
+
+## 0.4.3
+
+### Added
+- **Entity-diversified rerank top-K for multi-entity comparison queries.**
+  `search/rerank.py::_diversify_by_entity` (wired into `rerank_by_bm25`): when a
+  query names ≥2 distinct entities that are actually present in the candidate
+  hosts, the selected top-K is guaranteed to cover each named entity—its best
+  BM25+authority candidate is picked first—before remaining slots are filled by
+  global score. Fixes the "deep on 1 of N entities" weakness where the
+  highest-scoring entity's pages could monopolise the whole top-K (e.g.
+  comparing Cloudflare/Fastly/CloudFront). Within one entity the existing
+  authority boost still decides the winner (official/primary over aggregator).
+  Single-entity queries are unaffected (falls back to plain global top-K).
+- New shared helper `search/authority.py::host_brand_labels(url)` — non-generic
+  host brand labels, now the single source of truth for both OFFICIAL detection
+  in `classify_authority` and entity attribution in rerank.
+
 ## 0.4.2
 
 ### Changed

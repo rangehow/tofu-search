@@ -104,7 +104,7 @@ def test_ssl_error_returns_none_when_fallback_disabled(monkeypatch):
     # A non-legacy SSLError must NOT silently retry with verify=False.
     calls = []
 
-    def fake_do_request(url, timeout, verify=True, legacy_ssl=False):
+    def fake_do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
         calls.append({"verify": verify, "legacy_ssl": legacy_ssl})
         raise requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
 
@@ -122,7 +122,7 @@ def test_ssl_error_retries_insecurely_when_enabled(monkeypatch):
     configure(allow_insecure_ssl_fallback=True)
     calls = []
 
-    def fake_do_request(url, timeout, verify=True, legacy_ssl=False):
+    def fake_do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
         calls.append(verify)
         if verify:
             raise requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")

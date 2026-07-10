@@ -7,6 +7,11 @@ from tofu_search.fetch.core import (
     fetch_urls,
     get_publish_date_from_url,
 )
+from tofu_search.fetch.readers import (
+    SiteReader,
+    get_reader,
+    register_reader,
+)
 
 __all__ = [
     'fetch_page_content',
@@ -14,4 +19,7 @@ __all__ = [
     'fetch_contents_for_results',
     'fetch_urls',
     'extract_urls_from_text',
+    'SiteReader',
+    'register_reader',
+    'get_reader',
 ]
