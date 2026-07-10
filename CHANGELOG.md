@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+- **Per-engine request throttle (self-inflicted rate-limit guard).** Two
+  CONCURRENT `perform_web_search()` calls (e.g. two parallel paper-recommend
+  batches) could fire the same query at one HTML engine within the same second
+  and trip its rate-limit — the observed DuckDuckGo `202 (rate-limited)` that
+  emptied a whole batch. New process-global `search/_common.py::host_throttle`
+  (`_HostThrottle`, mirroring `engine_circuit`) enforces a minimum interval
+  between requests to the SAME engine, consulted inside `http_search_get` right
+  after the circuit-breaker skip and just before the GET:
+  - Per-engine locking — a wait on a busy engine never serializes a request to
+    a DIFFERENT engine, so the orchestrator's engine+fetch overlap is preserved.
+  - Upward-only jitter (`[0, +30%]` of the interval) so two colliding threads
+    desynchronize instead of re-colliding on the next tick; realized spacing is
+    always ≥ the configured interval.
+  - The wait is clamped to the per-request `timeout`, so it consumes budget the
+    caller already has and never pushes a query past its wall-clock deadline. A
+    circuit-open engine returns BEFORE the throttle and spends zero interval.
+  - Only the HTML-engine envelope is throttled. The arXiv / Semantic Scholar
+    JSON vertical path uses a separate `http_get` and stays UNTHROTTLED — it is
+    the breaker-independent fast path.
+- `SearchConfig.min_request_interval_ms` (default 400, env
+  `TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS`). Set to 0 to disable the throttle
+  (byte-identical to the old unthrottled path).
+- Tests: `tests/test_host_throttle.py` (8) — same-engine spacing, different
+  engines not serialized, jitter present + never below the interval floor,
+  clamp-to-timeout, `http_search_get` ordering (throttle consulted for a
+  healthy engine, skipped for a breaker-open one), plus two NEUTER bites
+  (interval=0 removes spacing; removing the wiring fails the ordering test).
+
 ## 0.5.0
 
 ### Added

@@ -48,6 +48,21 @@ class SearchConfig:
     # 0 disables the cap. Env: TOFU_SEARCH_FETCH_URL_DEADLINE_SECS.
     fetch_url_deadline_secs: int = 25
 
+    # ── Per-engine request throttle (self-inflicted rate-limit guard) ──
+    # Minimum interval (ms) between two requests to the SAME search engine,
+    # enforced process-globally in http_search_get just before the GET. Two
+    # CONCURRENT search calls (e.g. two parallel recommend batches) that would
+    # otherwise hit one engine within the same second — the cause of the
+    # observed DDG-HTML ``202 (rate-limited)`` — serialize to >= this interval
+    # instead. Per-engine (a busy engine never blocks a different one), with a
+    # small upward jitter so two colliding threads desynchronize. The wait is
+    # clamped to the request timeout, so it spends budget the caller already
+    # has and never pushes a query past its deadline. 0 disables the throttle
+    # (byte-identical to the old unthrottled path). Only wraps the HTML-engine
+    # envelope — the arXiv/Semantic-Scholar JSON vertical path is NOT throttled.
+    # Env: TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS.
+    min_request_interval_ms: int = 400
+
     # ── Proxy ──
     # Explicit proxy URL (e.g. 'http://10.0.0.1:8080'). A host that resolves a
     # proxy from its own Settings (e.g. chatui) injects it here; when empty the
@@ -172,6 +187,7 @@ def configure(**kwargs) -> SearchConfig:
             'TOFU_SEARCH_FETCH_URL_DEADLINE_SECS': ('fetch_url_deadline_secs', int),
             'TOFU_SEARCH_PROXY_URL': ('proxy_url', str),
             'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
+            'TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS': ('min_request_interval_ms', int),
         }
 
         # Apply env var defaults (only for fields not explicitly set by user)

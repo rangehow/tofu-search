@@ -12,6 +12,7 @@ Engine modules under ``tofu_search/search/engines/`` use ``http_search_get`` so 
 only own their parser and URL quirks — the HTTP envelope is DRY.
 """
 
+import random
 import re
 import threading
 import time
@@ -33,6 +34,7 @@ logger = get_logger(__name__)
 __all__ = [
     'HEADERS', 'clean_text', 'http_search_get',
     'soup_of', 'make_result', 'search_session', 'engine_circuit',
+    'host_throttle',
 ]
 
 # A 200 response whose body is at least this large but parses to ZERO result
@@ -150,6 +152,90 @@ engine_circuit = _EngineCircuit()
 
 
 # ═══════════════════════════════════════════════════════
+#  Per-engine request throttle (self-inflicted rate-limit guard)
+# ═══════════════════════════════════════════════════════
+
+class _HostThrottle:
+    """Space out requests to the SAME engine to a minimum interval.
+
+    Process-global and keyed by engine name (``'DDG-HTML'``, ``'Bing'`` …),
+    exactly like :class:`_EngineCircuit`. The bug it fixes is two CONCURRENT
+    ``perform_web_search`` calls (e.g. two parallel recommend batches) hitting
+    one engine within the same second and tripping its rate-limit (the observed
+    DDG-HTML ``202``). Because the state is a module global both calls consult,
+    the second caller's request is delayed until the interval has elapsed.
+
+    Per-engine locking: each engine has its OWN lock, so a wait on a busy
+    engine never serializes a request to a DIFFERENT engine — the engine +
+    fetch overlap the orchestrator relies on is preserved.
+
+    Jitter is upward-only ([0, +JITTER_FRAC] of the interval): the realized
+    spacing is always >= the configured interval, while two threads that would
+    otherwise re-collide on the next tick desynchronize.
+    """
+    JITTER_FRAC = 0.30
+
+    def __init__(self):
+        self._guard = threading.Lock()        # guards _locks / _last mutation
+        self._locks: dict[str, threading.Lock] = {}
+        self._last: dict[str, float] = {}     # engine -> last-request monotonic ts
+
+    def _lock_for(self, name: str) -> threading.Lock:
+        with self._guard:
+            lk = self._locks.get(name)
+            if lk is None:
+                lk = self._locks[name] = threading.Lock()
+            return lk
+
+    def _interval(self) -> float:
+        try:
+            return max(0.0, get_config().min_request_interval_ms / 1000.0)
+        except Exception:
+            # Fail-open: a config error must never stall search.
+            return 0.0
+
+    def wait(self, name: str, *, max_wait: float | None = None) -> float:
+        """Block until at least ``interval`` has elapsed since this engine's last
+        request, then stamp the new request time. Returns the seconds actually
+        slept (0.0 when the throttle is disabled or the interval already passed).
+
+        ``max_wait`` clamps the sleep to the caller's remaining budget (the
+        per-request timeout), so the throttle never pushes a query past its
+        deadline.
+        """
+        interval = self._interval()
+        if interval <= 0:
+            return 0.0
+        lk = self._lock_for(name)
+        with lk:
+            now = time.monotonic()
+            last = self._last.get(name)
+            slept = 0.0
+            if last is not None:
+                gap = now - last
+                if gap < interval:
+                    jitter = random.uniform(0.0, interval * self.JITTER_FRAC)
+                    delay = (interval - gap) + jitter
+                    if max_wait is not None:
+                        delay = min(delay, max_wait)
+                    if delay > 0:
+                        time.sleep(delay)
+                        slept = delay
+            self._last[name] = time.monotonic()
+            return slept
+
+    def reset(self):
+        """Drop all per-engine state (test isolation — this global is NOT reset
+        by the shared conftest, mirroring engine_circuit)."""
+        with self._guard:
+            self._locks.clear()
+            self._last.clear()
+
+
+host_throttle = _HostThrottle()
+
+
+# ═══════════════════════════════════════════════════════
 #  HTML parsing helpers
 # ═══════════════════════════════════════════════════════
 
@@ -236,9 +322,19 @@ def http_search_get(
     tag = f'[Search] {name}'
 
     # ── Circuit breaker: skip an engine that has been failing repeatedly ──
+    # (A benched engine returns here BEFORE the throttle, so it spends zero
+    #  interval budget.)
     if engine_circuit.is_open(name):
         logger.info('%s skipped (circuit open) query=%r', tag, query[:60])
         return []
+
+    # ── Per-engine request throttle: two concurrent search calls hitting this
+    #    same engine within the interval serialize to >= it (self-inflicted
+    #    rate-limit guard). Clamped to the request timeout so the wait spends
+    #    budget the caller already has, never pushing past its deadline. Only
+    #    the HTML-engine envelope is throttled — the JSON vertical path uses a
+    #    separate http_get and stays unthrottled. ──
+    host_throttle.wait(name, max_wait=float(timeout))
 
     hdrs = headers or HEADERS
 

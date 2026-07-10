@@ -32,7 +32,7 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.5.0'
+__version__ = '0.5.1'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
