@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.2
+
+### Added
+- **Identity fallback seams — “got a shell, not content” now reaches the host
+  browser.** Previously `try_browser_fetch` was only wired to TRANSPORT-level
+  failures (HTTP 401/403/406/429/5xx, timeout, connection errors). A 200 that
+  carries an SPA shell or a login wall — the dominant failure shape of
+  SSO-protected sites — went: static GET → shell/wall detection → anonymous
+  Playwright → `None`, and the host browser (the user's live, logged-in
+  session) was never consulted. `fetch_page_content` now offers the URL to the
+  registered `BrowserProvider` at five such dead-ends, each with a distinct
+  `reason`: `spa_shell` (200 + too little extracted text), `login_wall`
+  (bot/login wall in the raw HTML or in the extracted text), `known_spa`
+  (known-SPA domain whose anonymous render came back empty), and
+  `auth_source_failed` (an enabled auth-source replay yielded nothing — stored
+  cookies may be expired while the user's live session is still valid; the
+  anonymous pipeline only runs afterwards if the browser also yields nothing).
+  All five sites go through the existing deadline-aware wrappers, so the
+  per-URL budget still bounds the whole chain; with no provider registered
+  (or unconnected) every path is byte-identical to 0.5.1. Design:
+  `docs/FETCH_IDENTITY_PATHS_DESIGN.md` (chatui repo).
+- Tests: `tests/test_fetch_identity_fallback.py` (10) — drives the public
+  `fetch_page_content` offline and asserts outcomes (exactly one browser call
+  with the right reason; browser text wins; browser-empty preserves the
+  pre-seam result incl. the >50-char partial-shell path; Playwright success
+  never consults the browser). Neuter-verified: removing the `spa_shell`
+  seam turns exactly its three tests red.
+
 ## 0.5.1
 
 ### Added

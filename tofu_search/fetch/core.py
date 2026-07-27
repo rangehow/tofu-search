@@ -165,6 +165,15 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             return auth_text
         logger.info('[Fetch] auth-source fetch yielded nothing, falling back '
                     'to anonymous pipeline — %s', url[:80])
+        # Stored cookies may be expired while the user's LIVE browser session
+        # is still valid — a registered source means this domain is known to be
+        # login-walled, so the anonymous pipeline below is near-certain to hit
+        # the same wall. Try the host browser first (no-op when unconnected).
+        browser_text = _try_browser_fetch(url, max_chars, reason='auth_source_failed')
+        if browser_text:
+            logger.info('[Fetch] Browser fallback OK after auth-source failure — %s (%d chars)',
+                        url[:80], len(browser_text))
+            return browser_text
 
     # ── Skip-domain / SSRF / binary-media / circuit gate ──
     # After the reader + auth-source bypasses so a connected or reader-handled
@@ -175,7 +184,12 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
     # ── Known SPA domains: skip requests, go straight to Playwright ──
     if _is_known_spa(url):
         logger.debug('🎭 Known SPA domain, using Playwright — %s', url[:80])
-        return _try_playwright_fallback(url, max_chars, timeout)
+        pw_text = _try_playwright_fallback(url, max_chars, timeout)
+        if pw_text:
+            return pw_text
+        # Anonymous render got nothing (e.g. a login wall only a logged-in
+        # session can pass) — give the host browser a shot before giving up.
+        return _try_browser_fetch(url, max_chars, reason='known_spa')
 
     result = None
     is_pdf = False
@@ -315,7 +329,10 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             html = _decode_bytes(raw, resp.encoding)
             if _is_bot_protection(html):
                 logger.debug('🛡️ Bot protection detected, trying Playwright — %s', url[:80])
-                return _try_playwright_fallback(url, max_chars, timeout)
+                pw_text = _try_playwright_fallback(url, max_chars, timeout)
+                if pw_text:
+                    return pw_text
+                return _try_browser_fetch(url, max_chars, reason='login_wall')
             html_for_spa_check = html
             _html_head_cache.put(url, html[:20480])
             result = _extract_html_text(html, _CACHE_EXTRACT_LIMIT, url=url)
@@ -330,6 +347,9 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         pw_result = _try_playwright_fallback(url, max_chars, timeout)
         if pw_result:
             return pw_result
+        browser_text = _try_browser_fetch(url, max_chars, reason='login_wall')
+        if browser_text:
+            return browser_text
         logger.debug('Playwright also failed for bot page — %s', url[:80])
         return None
 
@@ -340,6 +360,13 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         pw_result = _try_playwright_fallback(url, max_chars, timeout)
         if pw_result:
             return pw_result
+        # 200 + SPA shell: the anonymous chain got a shell, not content — the
+        # user's browser (with its live sessions) is the last identity path.
+        browser_text = _try_browser_fetch(url, max_chars, reason='spa_shell')
+        if browser_text:
+            logger.info('[Fetch] Browser fallback OK after SPA shell — %s (%d chars)',
+                        url[:80], len(browser_text))
+            return browser_text
         if result and len(result) > 50:
             _fetch_cache.put(url, result)
             if max_chars and len(result) > max_chars:
