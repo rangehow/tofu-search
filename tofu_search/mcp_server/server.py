@@ -36,6 +36,7 @@ from tofu_search.search.format import format_search_for_tool_response
 from tofu_search.search.orchestrator import perform_web_search
 from tofu_search.search.vertical import (
     describe_domains,
+    detect_vertical_intent,
     list_domains,
     search_vertical,
     search_vertical_domain,
@@ -187,9 +188,22 @@ def build_server() -> FastMCP:
     async def search_vertical_tool(query: str, domain: str = 'auto') -> str:
         """Authoritative lookup; see the generated description."""
         if domain and domain != 'auto':
+            # Explicit domain: fan out across that domain's available types.
+            # Accepts free text, not just an identifier.
             result = await run_blocking(search_vertical_domain, domain, query)
         else:
-            result = await run_blocking(search_vertical, query, query)
+            # ★ Auto: detection MUST come first. search_vertical()'s first
+            # argument is a registered TYPE name ('arxiv', 'cve', ...), not a
+            # query -- passing the query there looks plausible and silently
+            # matches no handler, so every auto lookup would fall through to
+            # the "nothing matched" branch below. detect_vertical_intent gives
+            # the (type, identifier, params) triple the dispatcher wants.
+            intent = detect_vertical_intent(query)
+            if intent is None:
+                result = None
+            else:
+                vtype, identifier, params = intent
+                result = await run_blocking(search_vertical, vtype, identifier, params)
 
         if not result:
             known = ', '.join(list_domains())
