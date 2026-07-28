@@ -47,9 +47,21 @@ dependencies = [
 [project.optional-dependencies]
 playwright = ["playwright>=1.49"]
 pdf = ["pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
+# 'all' means every CONTENT-processing capability. The MCP server is an
+# interface layer, not a capability, so it is deliberately excluded: a library
+# user who wants better extraction should not silently acquire a protocol SDK.
 all = ["playwright>=1.49", "pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
+# Upper bound is intentional. v1.x is the SDK's only stable line and is in
+# maintenance mode; v2 exists but its client ecosystem is unproven, and the
+# SDK's own guidance is that dependants pin below it. tofu_search.mcp_server
+# touches exactly one SDK symbol, so moving the bound later is an import
+# change rather than a rewrite.
+mcp = ["mcp>=1.27,<2", "anyio>=4.0"]
 test = ["pytest>=8.0", "pytest-cov>=4.1"]
 dev = ["pytest>=8.0", "pytest-cov>=4.1", "ruff>=0.6"]
+
+[project.scripts]
+tofu-search-mcp = "tofu_search.mcp_server.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/rangehow/tofu-search"

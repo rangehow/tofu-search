@@ -308,6 +308,41 @@ Or just run `./install.sh` (see below).
 ```
 
 ## Concurrency & thread-safety
+## Run as an MCP server
+
+The library can be exposed to any MCP client (Claude Desktop, IDE agents,
+other agent frameworks) as a plugin.
+
+```bash
+pip install "tofu-search[mcp]"
+tofu-search-mcp                      # stdio, for a local plugin
+tofu-search-mcp --transport http     # Streamable HTTP (localhost:8000)
+```
+
+Add to a client config:
+
+```json
+{"mcpServers": {"tofu-search": {"command": "tofu-search-mcp"}}}
+```
+
+It exposes four tools — `web_search`, `fetch_page`, `search_vertical`,
+`verify_citations` — plus a `health://status` resource. The surface is
+deliberately narrow: `configure()` and the `register_*` seams are NOT tools,
+because a per-request caller must not be able to change global state or
+supply implementations.
+
+Design constraints an embedder should know (each enforced by a test):
+
+- **stdio is safe.** The library never writes to stdout; logs go to stderr.
+- **One process.** `--workers > 1` refuses to start. The per-engine throttle
+  and circuit-breaker state are per-process singletons, so N workers would
+  multiply the real request rate to every engine by N.
+- **Bounded concurrency.** At most 4 blocking searches run at once
+  (`--max-concurrency`); each one fans out into ~22 threads internally.
+- **Synchronous core.** Every tool runs the synchronous pipeline on a worker
+  thread via anyio — the asyncio event loop is never blocked by a search.
+
+## Concurrency & thread-safety
 
 Read this before embedding the library in a server — it is the difference
 between a working deployment and one that silently gets rate-limited.

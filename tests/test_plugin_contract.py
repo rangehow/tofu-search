@@ -158,6 +158,48 @@ def test_http_calls_go_through_a_transport_seam(path, rel):
         'a comment saying why.')
 
 
+def test_mcp_sdk_is_imported_from_exactly_one_place():
+    """The MCP SDK may only be reached via `from mcp.server.fastmcp import FastMCP`.
+
+    ★ This is what makes "migrating SDK major versions is an import change, not
+    a rewrite" a fact rather than a hope.
+
+    The SDK's v1.x line is in maintenance mode with a v2 already released, so
+    the migration is a question of when. Confining the coupling to one import
+    and two call sites keeps that migration mechanical. The moment a second
+    module reaches into `mcp.server.lowlevel`, `mcp.types` or similar, the
+    blast radius stops being knowable -- and it would happen gradually, one
+    convenient import at a time, which is exactly the kind of drift a guard
+    catches and a code review does not.
+    """
+    server_root = PKG_ROOT / 'mcp_server'
+    if not server_root.exists():
+        pytest.skip('mcp_server package not present')
+
+    allowed = ('mcp.server.fastmcp', 'FastMCP')
+    offenders = []
+    for path in sorted(server_root.rglob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ''
+                if module == 'mcp' or module.startswith('mcp.'):
+                    names = [a.name for a in node.names]
+                    if module != allowed[0] or names != [allowed[1]]:
+                        offenders.append(
+                            f'{path.name}:{node.lineno} from {module} import '
+                            f'{", ".join(names)}')
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == 'mcp' or alias.name.startswith('mcp.'):
+                        offenders.append(f'{path.name}:{node.lineno} import {alias.name}')
+
+    assert not offenders, (
+        'the MCP SDK must be reached only via '
+        '`from mcp.server.fastmcp import FastMCP`, so a future SDK migration '
+        f'stays an import change rather than a rewrite. Found: {offenders}')
+
+
 def test_transport_owner_list_has_no_stale_entries():
     """A seam that no longer exists must not stay whitelisted.
 
