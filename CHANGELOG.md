@@ -19,8 +19,9 @@
   anonymous pipeline only runs afterwards if the browser also yields nothing).
   All five sites go through the existing deadline-aware wrappers, so the
   per-URL budget still bounds the whole chain; with no provider registered
-  (or unconnected) every path is byte-identical to 0.5.1. Design:
-  `docs/FETCH_IDENTITY_PATHS_DESIGN.md` (chatui repo).
+  (or unconnected) every path is byte-identical to 0.5.1. The five seam sites
+  and their `reason` values above ARE the design contract; each is covered by a
+  test in `tests/test_fetch_identity_fallback.py`.
 - Tests: `tests/test_fetch_identity_fallback.py` (10) — drives the public
   `fetch_page_content` offline and asserts outcomes (exactly one browser call
   with the right reason; browser text wins; browser-empty preserves the

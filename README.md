@@ -1,7 +1,7 @@
 # 🔍 tofu-search
 
 **Multi-engine web search + content fetching with optional LLM filtering** — a
-standalone Python library extracted from the [Tofu AI assistant](https://github.com/rangehow/tofu-search).
+standalone Python library extracted from the Tofu AI assistant.
 
 This is a full re-extraction that keeps **100% of Tofu's current search/fetch
 capabilities**: every engine, the structured "vertical" lookups, one-hop
@@ -38,6 +38,10 @@ stays dependency-free when used standalone.
 - **File assets**: text-based assets (SVG, JSON, XML, YAML, CSS, JS, source
   code) are returned as their raw source by `fetch_page_content`; binary
   assets can be downloaded with the size-/SSRF-guarded `fetch_url_bytes`.
+- **Citation verification**: check a bibliography for hallucinated references
+  against CrossRef / arXiv / Semantic Scholar, with zero LLM calls.
+- **Site readers**: pluggable per-domain handlers that read a site through its
+  public endpoint instead of scraping the page.
 - **Host integration seams**: register a browser provider (fetch/search via a
   real browser the user controls) and an auth-source provider (cookies/proxy
   for login-walled domains) — both no-ops by default.
@@ -133,6 +137,64 @@ print(record['content'])   # CVSS score, description, references from NVD
 # Or force a domain-level fan-out (free-text → Hugging Face + Semantic Scholar):
 from tofu_search import search_vertical_domain
 print(search_vertical_domain('academic', 'mamba state space models')['content'])
+
+# Which domains can serve a request right now? A domain whose handlers all
+# need a missing credential is omitted, so you never advertise a dead one.
+from tofu_search import list_domains
+print(list_domains())        # ['academic', 'code', 'finance', 'security', ...]
+```
+
+## Citation verification
+
+Detects likely-hallucinated references in a paper or `.bib` file by checking
+each one against authoritative free catalogues — **no LLM calls**, just one or
+two HTTP GETs per reference.
+
+```python
+from tofu_search import verify_bibtex, verify_references, summarize
+
+results = verify_bibtex(open('refs.bib').read())   # or verify_references(text)
+summary = summarize(results)
+
+if summary['has_suspicious']:
+    for r in summary['suspicious']:
+        print(r['citation']['title'], '—', r['evidence'].get('reason'))
+```
+
+The verdict is deliberately **three-state**, not a boolean, because "we could
+not find it" is not the same as "it is fake":
+
+| Verdict | Meaning |
+|---|---|
+| `verified` | An authoritative record matches the claim. |
+| `suspicious` | High-confidence contradiction — a concrete DOI/arXiv ID that definitively does not resolve, or resolves to a *different* paper. |
+| `unverifiable` | Could neither confirm nor refute (no identifier, catalogue coverage gap, book/dataset, rate-limit, transport error). **Never** report these as fabrications. |
+
+Only a claim carrying a concrete identifier can ever be `suspicious`. A
+title-only claim that fails to match is a coverage gap, so it degrades to
+`unverifiable`. Each result carries an `evidence` dict with the exact catalogue
+URL checked, the matched title and a similarity score — quote those when
+explaining a verdict rather than asserting it bare.
+
+Lower-level pieces are exported too: `parse_bibtex` / `parse_references` turn
+text into `Citation` objects, and `verify_citations` verifies a list of them
+concurrently.
+
+## Site readers
+
+Some sites expose a public endpoint that returns cleaner content than their
+rendered page. A `SiteReader` claims a domain and handles it before the generic
+fetch pipeline runs.
+
+```python
+from tofu_search import SiteReader, register_reader
+
+class MyReader(SiteReader):
+    name = 'example'
+    def matches(self, url): return 'example.com' in url
+    def read(self, url, *, max_chars=None, timeout=15): ...
+
+register_reader(MyReader())
 ```
 
 ## Host integration (provider seams)
@@ -244,6 +306,58 @@ Or just run `./install.sh` (see below).
 ./install.sh --playwright
 ./install.sh --pdf
 ```
+
+## Concurrency & thread-safety
+
+Read this before embedding the library in a server — it is the difference
+between a working deployment and one that silently gets rate-limited.
+
+**The library is synchronous.** There is no `async` API. `perform_web_search`
+blocks for as long as the pipeline runs (bounded by `search_deadline_secs`,
+default 45s). To call it from an asyncio application, push it to a worker
+thread (`anyio.to_thread.run_sync` / `loop.run_in_executor`) — calling it
+directly on the event loop will stall every other task.
+
+**It is internally concurrent.** One `perform_web_search` call spawns an engine
+pool plus a 16-worker fetch pool, so N concurrent calls means roughly N × 22
+threads and a matching number of open sockets. Bound the number of in-flight
+calls (a semaphore or a capacity limiter) rather than assuming the default
+thread-pool ceiling will do it for you.
+
+**Its rate-limiting state is per-process.** The per-engine request throttle,
+the engine circuit breaker, the domain circuit breaker, the fetch cache, the
+Playwright pool and the registered providers are all module-level singletons
+created at import time. They are thread-safe, but they are **not** shared
+across processes. Running several worker processes therefore multiplies your
+request rate to every engine while each process still believes it is respecting
+`min_request_interval_ms` — which is exactly how a search engine starts
+answering `202 (rate-limited)` and a whole batch comes back empty. **Run one
+process** and scale with the in-process thread pools; if you genuinely need
+multiple processes, externalize the throttle state first.
+
+**Configuration is global; overrides are per-call.** `configure()` mutates
+process-wide state and is meant to be called ONCE at startup. For anything that
+varies per request, pass keyword overrides to `search(...)` — those are applied
+to a copy and never touch the global config. In a multi-tenant server, calling
+`configure()` per request would let one caller change another caller's search
+behaviour.
+
+**Logging goes to stderr, never stdout.** The library attaches a stderr handler
+only when the root logger has none, and otherwise defers to the host's logging
+configuration. Nothing in the package writes to stdout, which keeps it safe to
+embed in a process whose stdout carries a protocol stream.
+
+## Contributing
+
+Work on a branch and open a pull request; run `ruff check .` and `pytest`
+before pushing.
+
+Do **not** edit this repository from several concurrent sessions sharing one
+working tree. It is now a standalone component with its own release cycle, and
+parallel in-place edits produce transient half-written states — a module that
+imports a symbol its dependency has not gained yet will fail collection for
+everyone, and the failure looks like a real bug rather than a race. One tree,
+one editor, one branch.
 
 ## License
 
