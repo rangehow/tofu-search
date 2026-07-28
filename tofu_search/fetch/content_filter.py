@@ -1,7 +1,8 @@
 """tofu_search.fetch.content_filter — LLM-based web content relevance filtering.
 
 Standalone version — uses tofu_search.llm_adapter instead of chatui's dispatch_chat.
-When no LLM is configured, filter is silently skipped (raw text returned as-is).
+When no LLM is configured, filtering is skipped (raw text returned as-is; the
+skip is logged at debug).
 """
 
 import time

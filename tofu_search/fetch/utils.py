@@ -23,8 +23,10 @@ from tofu_search.config import get_config
 # Suppress InsecureRequestWarning for SSL-fallback retries
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Suppress noisy "Retrying ... after connection broken by ReadTimeoutError" warnings
-# These are logged by urllib3 internally; we handle errors at the requests level already
+# Raise urllib3's connection-pool logger to ERROR so its transient
+# "Retrying ... after connection broken by ReadTimeoutError" WARNINGs are
+# muted (we already handle/log these at the requests level) — real pool
+# errors are ERROR-and-above and still surface.
 import logging as _logging
 
 _logging.getLogger('urllib3.connectionpool').setLevel(_logging.ERROR)
@@ -86,8 +88,6 @@ _HEADERS = {
     'Accept-Encoding': 'gzip, deflate',
     'Connection': 'keep-alive',
 }
-
-# NOTE: trafilatura/playwright availability logged on first use (lazy imports)
 
 
 # ═══════════════════════════════════════════════════════
@@ -587,7 +587,7 @@ def _normalize_code_hosting_url(url):
         if path_type in ('overview', 'resources'):
             path_type = 'abs'
         arxiv_url = f'https://arxiv.org/{path_type}/{paper_id}'
-        logger.info('[Fetch] arXiv wrapper %s → %s', host, arxiv_url)
+        logger.info('[Fetch] arXiv wrapper %s -> %s', host, arxiv_url)
         return arxiv_url
 
     # GitHub blob: do NOT rewrite — we extract code directly from the
@@ -600,7 +600,7 @@ def _normalize_code_hosting_url(url):
     if m:
         raw_url = f'{m.group("base")}-/raw/{m.group("rest")}'
         raw_url = raw_url.split('?')[0]
-        logger.debug('[Fetch] GitLab blob → raw: %s', raw_url[:120])
+        logger.debug('[Fetch] GitLab blob -> raw: %s', raw_url[:120])
         return raw_url
 
     # Bitbucket src → raw
@@ -608,7 +608,7 @@ def _normalize_code_hosting_url(url):
     if m:
         raw_url = f'{m.group("base")}/raw/{m.group("rest")}'
         raw_url = raw_url.split('?')[0]
-        logger.debug('[Fetch] Bitbucket src → raw: %s', raw_url[:120])
+        logger.debug('[Fetch] Bitbucket src -> raw: %s', raw_url[:120])
         return raw_url
 
     return url
@@ -716,7 +716,7 @@ def _should_fetch(url):
         if any(s in p.netloc.lower() for s in get_config().skip_domains): return False
         # ── SSRF guard: reject hosts that resolve to internal addresses ──
         if get_config().block_private_addresses and not _host_is_safe(p.hostname or ''):
-            logger.warning('⛔ Skipped (SSRF guard, internal address): %s', url[:80])
+            logger.warning('[Fetch] Skipped (SSRF guard, internal address): %s', url[:80])
             return False
         # Skip BINARY media (can't be extracted as text). ``.svg`` is text and
         # is handled by the text-asset branch in fetch_page_content, so it is
@@ -726,7 +726,9 @@ def _should_fetch(url):
             return False
         # 域名级熔断检查
         if _circuit.is_open(url):
-            logger.warning('⚡ Skipped (circuit open): %s', url[:80])
+            # Expected + self-recovering: the circuit trip itself is already
+            # logged at warning; per-URL skips at that level would spam.
+            logger.debug('[Fetch] Skipped (circuit open) — %s', url[:80])
             return False
         return True
     except Exception as e:

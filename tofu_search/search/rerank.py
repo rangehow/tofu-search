@@ -259,7 +259,7 @@ def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
 
     elapsed = time.time() - t0
     scores_str = ', '.join(f'#{item[1]}:{item[0]:.3f}' for item in scored[:top_k])
-    logger.info('[Rerank] BM25 %d→%d results in %.1fms. div=%s Top-%d (idx:score): %s  query=%r',
+    logger.info('[Rerank] BM25 %d->%d results in %.1fms. div=%s Top-%d (idx:score): %s  query=%r',
                 len(results), top_k, elapsed * 1000, diversified is not None,
                 top_k, scores_str, query[:60])
 

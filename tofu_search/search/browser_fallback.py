@@ -55,7 +55,7 @@ def search_via_browser(query, max_results=8):
         if html:
             results = parse_ddg_html_text(html, max_results=max_results,
                                           source='DuckDuckGo (via browser)')
-            logger.info('[Search] Browser fetch_html → parsed %d results (%d HTML chars)',
+            logger.info('[Search] Browser fetch_html -> parsed %d results (%d HTML chars)',
                         len(results), len(html))
             if results:
                 return results

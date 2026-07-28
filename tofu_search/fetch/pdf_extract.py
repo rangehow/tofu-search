@@ -132,6 +132,7 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = 0, url: str = '') -> str
         finally:
             doc.close()
         if not parts:
+            logger.info('[PDF] no extractable text (%d pages) — %s', n, url[:80] if url else '?')
             return '[PDF: no extractable text]'
         full = re.sub(r'\n{3,}', '\n\n', '\n\n'.join(parts))
         return full

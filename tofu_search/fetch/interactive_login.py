@@ -79,7 +79,7 @@ def _run_capture(domain: str, login_url: str, timeout_s: int) -> dict:
         return {'ok': False, 'reason': 'unavailable', 'error': str(e)}
 
     hints = _LOGIN_COOKIE_HINTS.get(domain, ())
-    logger.info('[Login] launching headful browser for %s → %s (timeout=%ds)',
+    logger.info('[Login] launching headful browser for %s -> %s (timeout=%ds)',
                 domain, login_url, timeout_s)
 
     pw = None

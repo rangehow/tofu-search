@@ -67,7 +67,7 @@ def _mk_deadline_browser(budget_blown):
     """Wrap the module browser fallback so it's skipped once the URL budget is blown."""
     def _wrapped(url, max_chars, reason='unknown'):
         if budget_blown():
-            logger.info('[Fetch] ⏱ skip browser fallback (per-URL deadline) — %s', url[:80])
+            logger.info('[Fetch] skip browser fallback (per-URL deadline) — %s', url[:80])
             return None
         return _try_browser_fetch(url, max_chars, reason=reason)
     return _wrapped
@@ -77,7 +77,7 @@ def _mk_deadline_playwright(budget_blown):
     """Wrap the module Playwright fallback so it's skipped once the URL budget is blown."""
     def _wrapped(url, max_chars, timeout):
         if budget_blown():
-            logger.info('[Fetch] ⏱ skip Playwright fallback (per-URL deadline) — %s', url[:80])
+            logger.info('[Fetch] skip Playwright fallback (per-URL deadline) — %s', url[:80])
             return None
         return _try_playwright_fallback(url, max_chars, timeout)
     return _wrapped
@@ -183,7 +183,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
 
     # ── Known SPA domains: skip requests, go straight to Playwright ──
     if _is_known_spa(url):
-        logger.debug('🎭 Known SPA domain, using Playwright — %s', url[:80])
+        logger.debug('[Fetch] Known SPA domain, using Playwright — %s', url[:80])
         pw_text = _try_playwright_fallback(url, max_chars, timeout)
         if pw_text:
             return pw_text
@@ -238,7 +238,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
                            '(set allow_insecure_ssl_fallback=True to enable) — %s: %s', domain, e)
             return None
         else:
-            logger.warning('⚠️ SSL failed, retrying WITHOUT certificate verification (insecure) — %s: %s',
+            logger.warning('SSL failed, retrying WITHOUT certificate verification (insecure) — %s: %s',
                            domain, e, exc_info=True)
             try:
                 resp, raw = _do_request(url, timeout, verify=False, deadline_ts=_url_deadline_ts)
@@ -263,7 +263,9 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
     except requests.exceptions.ConnectionError as e:
         err_str = str(e).lower()
         if 'pool is closed' in err_str:
-            logger.warning('ConnectionError (pool closed, not server fault) — %s: %s', url[:80], e)
+            # Benign internal/shutdown race — not a server fault, records no
+            # circuit failure, so debug rather than warning.
+            logger.debug('ConnectionError (pool closed, not server fault) — %s: %s', url[:80], e)
         elif 'timeout' in err_str or 'timed out' in err_str:
             _circuit.record_failure(url)
             logger.warning('Timeout (ConnectionError) — %s', url[:80], exc_info=True)
@@ -328,7 +330,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         else:
             html = _decode_bytes(raw, resp.encoding)
             if _is_bot_protection(html):
-                logger.debug('🛡️ Bot protection detected, trying Playwright — %s', url[:80])
+                logger.debug('[Fetch] Bot protection detected, trying Playwright — %s', url[:80])
                 pw_text = _try_playwright_fallback(url, max_chars, timeout)
                 if pw_text:
                     return pw_text
@@ -342,7 +344,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
 
     # ── Post-extraction bot-protection check ──
     if result and _is_bot_extracted_text(result):
-        logger.debug('🛡️ Bot protection in extracted text (%d chars), '
+        logger.debug('[Fetch] Bot protection in extracted text (%d chars), '
                      'trying Playwright — %s', len(result), url[:80])
         pw_result = _try_playwright_fallback(url, max_chars, timeout)
         if pw_result:
@@ -420,7 +422,7 @@ def fetch_url_bytes(url, timeout=None, max_bytes=None):
         logger.debug('[Fetch] bytes: rejected non-HTTP URL — %.80s', url)
         return None
     if cfg.block_private_addresses and not _host_is_safe(p.hostname or ''):
-        logger.warning('⛔ bytes: SSRF guard blocked internal address — %s', url[:80])
+        logger.warning('[Fetch] bytes: SSRF guard blocked internal address — %s', url[:80])
         return None
 
     try:
@@ -429,7 +431,7 @@ def fetch_url_bytes(url, timeout=None, max_bytes=None):
         logger.debug('[Fetch] bytes: HTTP %d — %s', e.status_code, url[:120])
         return None
     except Exception as e:
-        logger.warning('[Fetch] bytes: download failed — %s: %s', url[:80], e)
+        logger.warning('[Fetch] bytes: download failed — %s: %s: %s', url[:80], type(e).__name__, e)
         return None
 
     if not raw:
@@ -538,7 +540,7 @@ def fetch_contents_for_results(results, max_fetch=None, max_chars=None, target_o
                             result['full_content'] = content
                             ok_count += 1
                         if fetch_elapsed > 5:
-                            logger.info('[Fetch] ⚠ SLOW url=%.80s  %.1fs  ok=%s chars=%d',
+                            logger.info('[Fetch] SLOW url=%.80s  %.1fs  ok=%s chars=%d',
                                         url, fetch_elapsed, ok, chars)
                 except Exception as e:
                     logger.warning('[Fetch] fetch_contents thread error: %s', e, exc_info=True)

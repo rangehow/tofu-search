@@ -532,17 +532,17 @@ class PlaywrightPool:
             if body_text and len(body_text) > 50:
                 if max_chars and len(body_text) > max_chars:
                     body_text = body_text[:max_chars] + '\n[…truncated]'
-                logger.debug('🎭 Playwright OK: %s chars in %.1fs — %s', f'{len(body_text):,}', elapsed, url[:80])
+                logger.debug('[Pool] Playwright OK: %s chars in %.1fs — %s', f'{len(body_text):,}', elapsed, url[:80])
                 return body_text
 
             # innerText 不行，退而用 trafilatura/BS4 解析渲染后的 HTML
             html = page.content()
             text = extract_html_text(html, max_chars or 0, url=url)
             if text and len(text) > 50:
-                logger.debug('🎭 Playwright (extract) OK: %s chars in %.1fs — %s', f'{len(text):,}', elapsed, url[:80])
+                logger.debug('[Pool] Playwright (extract) OK: %s chars in %.1fs — %s', f'{len(text):,}', elapsed, url[:80])
                 return text
 
-            logger.debug('🎭 Playwright got empty content — %s', url[:80])
+            logger.debug('[Pool] Playwright got empty content — %s', url[:80])
             return None
 
         except Exception as e:
@@ -553,7 +553,7 @@ class PlaywrightPool:
             # error.log stays clean; upgrade to warning only if it blocks the
             # whole pipeline (which it doesn't).
             ename = type(e).__name__
-            logger.debug('🎭 Playwright error (%s) — %s: %s', ename, url[:80], e, exc_info=True)
+            logger.debug('[Pool] Playwright error (%s) — %s: %s', ename, url[:80], e, exc_info=True)
             return None
         finally:
             if context:
@@ -628,7 +628,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)  # 宽裕超时
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright worker timeout (%ss) — %s', timeout, url[:80])
+            logger.warning('[Pool] Playwright worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
     def fetch_authenticated(self, url, cookies, proxy='', timeout=25, max_chars=None):
@@ -646,7 +646,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright auth worker timeout (%ss) — %s', timeout, url[:80])
+            logger.warning('[Pool] Playwright auth worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
     def search_authenticated(self, url, cookies, proxy='', timeout=20,
@@ -666,7 +666,7 @@ class PlaywrightPool:
         try:
             return result_q.get(timeout=timeout + 30)
         except _queue_mod.Empty:
-            logger.warning('🎭 Playwright auth-search worker timeout (%ss) — %s', timeout, url[:80])
+            logger.warning('[Pool] Playwright auth-search worker timeout (%ss) — %s', timeout, url[:80])
             return None
 
 

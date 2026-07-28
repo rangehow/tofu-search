@@ -91,7 +91,7 @@ def do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
     else:
         sess = _session_no_ssl
     domain = urlparse(url).netloc[:40]
-    logger.debug('→ GET %s  (timeout=%ds, ssl=%s)', url[:100], timeout, '✓' if verify else '✗')
+    logger.debug('[Fetch] GET %s  (timeout=%ds, ssl=%s)', url[:100], timeout, 'on' if verify else 'off')
     t0 = time.time()
     resp = sess.get(url, timeout=(min(timeout, 8), timeout),
                     stream=True, allow_redirects=True, verify=verify)
@@ -99,7 +99,7 @@ def do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
     if not resp.ok:
         status = resp.status_code
         resp.close()
-        logger.debug('← %d in %dms — %s', status, conn_ms, domain)
+        logger.debug('[Fetch] resp %d in %dms — %s', status, conn_ms, domain)
         raise HttpError(status, url)
     ct = resp.headers.get('Content-Type', '').lower()
     cl = int(resp.headers.get('Content-Length', 0) or 0)
@@ -147,12 +147,12 @@ def do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
         finally:
             resp2.close()
         elapsed_ms = int((time.time() - t0) * 1000)
-        logger.debug('← 200 %sB in %dms (no-br retry) ct=%s — %s',
+        logger.debug('[Fetch] resp 200 %sB in %dms (no-br retry) ct=%s — %s',
                      f'{dl:,}', elapsed_ms, ct[:40], domain)
         return resp2, b''.join(chunks)
     except Exception:
-        # Any other error mid-stream (pool closed, socket reset, etc.)
-        # — always close to release the decompressor before GC can crash.
+        # Any other error mid-stream (pool closed, socket reset, etc.):
+        # always close to release the decompressor before GC can crash.
         resp.close()
         raise
     resp.close()
@@ -161,7 +161,7 @@ def do_request(url, timeout, verify=True, legacy_ssl=False, deadline_ts=None):
                        f'{dl:,}', f'{cfg.fetch_max_bytes:,}', url[:80])
         raise HttpError(413, url)
     elapsed_ms = int((time.time() - t0) * 1000)
-    logger.debug('← 200 %sB in %dms  ct=%s — %s', f'{dl:,}', elapsed_ms, ct[:40], domain)
+    logger.debug('[Fetch] resp 200 %sB in %dms  ct=%s — %s', f'{dl:,}', elapsed_ms, ct[:40], domain)
     return resp, b''.join(chunks)
 
 
@@ -201,7 +201,7 @@ def try_playwright_fallback(url, max_chars, timeout):
     if pw_text and len(pw_text) > 50:
         # ── Guard: Playwright may also return bot-protection content ──
         if _is_bot_extracted_text(pw_text):
-            logger.debug('🛡️ Playwright returned bot-protection text (%d chars), discarding — %s',
+            logger.debug('[Fetch] Playwright returned bot-protection text (%d chars), discarding — %s',
                          len(pw_text), url[:80])
             return None
         _fetch_cache.put(url, pw_text)
@@ -282,7 +282,7 @@ def try_browser_fetch(url, max_chars, reason='unknown'):
         if text:
             # ── Guard: browser may also return bot-protection pages ──
             if _is_bot_extracted_text(text):
-                logger.debug('🛡️ Browser fallback returned bot-protection text (%d chars), '
+                logger.debug('[Fetch] Browser fallback returned bot-protection text (%d chars), '
                              'discarding — %s', len(text), url[:80])
                 with _browser_fallback_lock:
                     _browser_fallback_stats['fail'] += 1

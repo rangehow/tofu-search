@@ -198,7 +198,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                 fetch_futs[fut] = r
             if first_fetch_submitted_at is None:
                 first_fetch_submitted_at = time.time()
-                logger.info('[Search] ⚡ First fetch submitted at +%.1fs (pipeline overlap started)',
+                logger.info('[Search] First fetch submitted at +%.1fs (pipeline overlap started)',
                             first_fetch_submitted_at - pipeline_t0)
 
     # ══ Step 1: Fire all engines + immediate fetch submission ══
@@ -228,15 +228,15 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     if r:
                         engine_counts[tag] = len(r)
                         engine_timings[tag] = engine_elapsed
-                        logger.info('[Search] ✓ %s returned %d results in %.1fs → submitting fetches',
+                        logger.info('[Search] %s returned %d results in %.1fs -> submitting fetches',
                                     tag, len(r), engine_elapsed)
                         _submit_fetches_for_batch(r)
                     else:
                         engine_empty.append(tag)
                         engine_timings[tag] = engine_elapsed
-                        logger.info('[Search] ○ %s returned 0 results in %.1fs', tag, engine_elapsed)
+                        logger.info('[Search] %s returned 0 results in %.1fs', tag, engine_elapsed)
                 except Exception as e:
-                    logger.warning('[Search] ✗ %s failed in %.1fs: %s', tag, engine_elapsed, e)
+                    logger.warning('[Search] %s failed in %.1fs: %s', tag, engine_elapsed, e)
                     engine_errors[tag] = str(e)[:200]
                     engine_timings[tag] = engine_elapsed
         except TimeoutError:
@@ -302,7 +302,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     if len(kept_urls) < target_ok * 1.5:
         target_ok = max(max_results, int(len(kept_urls) / 1.5))
         if target_ok < _original_target_ok:
-            logger.info('[Fetch] target_ok reduced %d → %d '
+            logger.info('[Fetch] target_ok reduced %d -> %d '
                         '(candidate pool=%d, need headroom for Race-to-N)',
                         _original_target_ok, target_ok, len(kept_urls))
 
@@ -338,7 +338,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                         if url in kept_urls:
                             kept_ok += 1
                     if fetch_elapsed > 5:
-                        logger.info('[Fetch] ⚠ SLOW url=%.80s  %.1fs  ok=%s chars=%d',
+                        logger.info('[Fetch] SLOW url=%.80s  %.1fs  ok=%s chars=%d',
                                     url, fetch_elapsed, ok, chars)
                 except Exception as e:
                     logger.warning('[Fetch] fetch thread error: %s', e, exc_info=True)
@@ -347,7 +347,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                 if _budget_left() is not None and _budget_left() <= 0:
                     _deadline_hit = True
                     remaining = [f for f in pending_futs if not f.done()]
-                    logger.warning('[Fetch] ⏱ DEADLINE hit (%ds budget) after %.1fs — '
+                    logger.warning('[Fetch] DEADLINE hit (%ds budget) after %.1fs — '
                                    'force-returning %d fetched page(s), cancelling %d in-flight. query=%r',
                                    _deadline_secs,
                                    time.time() - (first_fetch_submitted_at or step4_t0),
@@ -372,7 +372,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
             # downstream stages short-circuit and the diag marker is set.
             if _budget_left() is not None and _budget_left() <= 0:
                 _deadline_hit = True
-                logger.warning('[Fetch] ⏱ DEADLINE hit (%ds budget) at fetch-wait ceiling — '
+                logger.warning('[Fetch] DEADLINE hit (%ds budget) at fetch-wait ceiling — '
                                'force-returning partial results. query=%r', _deadline_secs, query[:60])
             else:
                 logger.warning('[Fetch] as_completed timeout (%.0fs)', _wait_ceiling, exc_info=True)
@@ -411,7 +411,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     if first_fetch_submitted_at:
         overlap_duration = step_timings['step1_engines'] - (first_fetch_submitted_at - pipeline_t0)
         if overlap_duration > 0.5:
-            logger.info('[Search] ⚡ Pipeline overlap saved ~%.1fs '
+            logger.info('[Search] Pipeline overlap saved ~%.1fs '
                         '(fetches started at +%.1fs, engines finished at +%.1fs)',
                         overlap_duration,
                         first_fetch_submitted_at - pipeline_t0,
@@ -442,7 +442,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     if val == IRRELEVANT_SENTINEL:
                         irrelevant_urls.add(r['url'])
                         r['full_content'] = ''
-                        logger.info('[Search] ✗ IRRELEVANT dropped: %s', r['url'][:100])
+                        logger.debug('[Search] IRRELEVANT dropped: %s', r['url'][:100])
                     else:
                         r['full_content'] = val
             if irrelevant_urls:
@@ -481,8 +481,8 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         timing_parts.append(f'{step_name}={elapsed:.1f}s')
     timing_str = ', '.join(timing_parts)
 
-    logger.info('[Search] Pipeline: %d raw → %d url-dedup → %d content-dedup → '
-                '%d fetched → -%d irrelevant → %d relevant → %d reranked  '
+    logger.info('[Search] Pipeline: %d raw -> %d url-dedup -> %d content-dedup -> '
+                '%d fetched -> -%d irrelevant -> %d relevant -> %d reranked  '
                 'TOTAL=%.1fs  [%s]  query=%r',
                 len(all_results), url_dedup_count, content_dedup_count,
                 fetch_count, len(irrelevant_urls), len(relevant),
@@ -491,26 +491,26 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     if url_timings:
         url_timings.sort(key=lambda x: -x[1])
         slow_summary = '  '.join(
-            f'[{"✓" if ok else "✗"}]{url[:50]}={et:.1f}s'
+            f'[{"ok" if ok else "fail"}]{url[:50]}={et:.1f}s'
             for url, et, ok, _chars in url_timings[:8]
         )
         logger.info('[Fetch] Timing breakdown (slowest first): %s', slow_summary)
 
     if step_timings.get('step4_page_fetch', 0) > 15:
-        logger.warning('[Search] ⚠ SLOW step4_page_fetch=%.1fs (>15s threshold). query=%r',
+        logger.warning('[Search] SLOW step4_page_fetch=%.1fs (>15s threshold). query=%r',
                        step_timings['step4_page_fetch'], query[:60])
     if step_timings.get('step5_llm_filter', 0) > 20:
-        logger.warning('[Search] ⚠ SLOW step5_llm_filter=%.1fs (>20s threshold). query=%r',
+        logger.warning('[Search] SLOW step5_llm_filter=%.1fs (>20s threshold). query=%r',
                        step_timings['step5_llm_filter'], query[:60])
     if pipeline_total > 30:
-        logger.warning('[Search] ⚠ SLOW PIPELINE total=%.1fs (>30s threshold) — breakdown: %s  query=%r',
+        logger.warning('[Search] SLOW PIPELINE total=%.1fs (>30s threshold) — breakdown: %s  query=%r',
                        pipeline_total, timing_str, query[:60])
 
     final_results = SearchResultList(relevant[:max_results])
     final_results._engine_breakdown = engine_breakdown
     final_results._deadline_hit = _deadline_hit
     if _deadline_hit:
-        logger.warning('[Search] ⏱ returned PARTIAL results (%d) — wall-clock deadline '
+        logger.warning('[Search] returned PARTIAL results (%d) — wall-clock deadline '
                        '(%ds) fired, TOTAL=%.1fs. query=%r',
                        len(final_results), _deadline_secs, pipeline_total, query[:60])
 

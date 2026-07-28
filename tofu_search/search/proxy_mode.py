@@ -143,7 +143,7 @@ class ProxyModeManager:
             prev = self._pref.get(engine, {}).get('mode')
             self._pref[engine] = {'mode': mode, 'ts': time.time()}
         if prev != mode:
-            logger.info('[Search] proxy-path learned: %s → %s', engine, mode)
+            logger.info('[Search] proxy-path learned: %s -> %s', engine, mode)
 
     def record_failure(self, engine: str, mode: str):
         """Forget a sticky preference that just failed on its own path.

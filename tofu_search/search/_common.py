@@ -405,7 +405,7 @@ def http_search_get(
             if isinstance(e, requests.Timeout):
                 logger.warning('%s timeout via %s for query: %s', tag, mode, query[:80])
             else:
-                logger.warning('%s request failed via %s for query %r: %s', tag, mode, query[:80], e)
+                logger.warning('%s request failed via %s for query %r: %s: %s', tag, mode, query[:80], type(e).__name__, e)
             break
         except Exception as e:
             logger.error('%s error via %s: %s', tag, mode, e, exc_info=True)

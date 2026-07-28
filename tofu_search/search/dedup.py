@@ -87,6 +87,6 @@ def dedup_by_content(results: list[dict], threshold: float = 0.45) -> list[dict]
             keep_indices.append(i)
 
     if removed:
-        logger.info('[ContentDedup] %d→%d results (removed %d near-duplicates, threshold=%.2f)',
+        logger.info('[ContentDedup] %d->%d results (removed %d near-duplicates, threshold=%.2f)',
                     len(results), len(keep), removed, threshold)
     return keep

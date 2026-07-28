@@ -237,10 +237,12 @@ def _try_extract_github_blob(html_text, url):
 
     raw_lines = _find_nested_key(payload, 'rawLines')
     if not raw_lines or not isinstance(raw_lines, list):
+        logger.debug('[Fetch] GitHub blob matched but no rawLines — %s', url[:80])
         return None
 
     code = '\n'.join(raw_lines)
     if len(code) < 10:
+        logger.debug('[Fetch] GitHub blob rawLines too short (%d chars) — %s', len(code), url[:80])
         return None
 
     # Extract metadata for a nice header
@@ -312,7 +314,7 @@ def extract_html_text(html, max_chars, url=''):
                                             include_links=True,        # ★ include_links!
                                             include_formatting=True)   # ★ keep headings/lists/emphasis as markdown
     except Exception as e:
-        logger.warning('Trafilatura failed: %s', e, exc_info=True)
+        logger.warning('Trafilatura failed for %s: %s', url[:80], e, exc_info=True)
 
     # ── Phase 2: BeautifulSoup fallback / link extraction ──
     try:
@@ -355,7 +357,7 @@ def extract_html_text(html, max_chars, url=''):
             if not main_text or len(main_text) < 30:
                 return None
     except Exception as e:
-        logger.warning('BS4 extraction failed: %s', e, exc_info=True)
+        logger.warning('BS4 extraction failed for %s: %s', url[:80], e, exc_info=True)
         if main_text:
             links = []
         else:
