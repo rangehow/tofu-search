@@ -27,6 +27,182 @@ def detect(q):
     return None
 
 
+def _parse_entry(entry, ns):
+    """Extract one Atom <entry> into a plain paper dict.
+
+    Shared by the id lookup and the free-text query path so both read the same
+    Atom fields the same way — the parsing lives once.
+    """
+    raw_id = (entry.findtext('a:id', '', ns) or '').strip()
+    m = re.search(r'/abs/(.+?)(?:v\d+)?$', raw_id)
+    arxiv_id = m.group(1) if m else ''
+    title = re.sub(r'\s+', ' ', (entry.findtext('a:title', '', ns) or '')).strip()
+    summary = re.sub(r'\s+', ' ', (entry.findtext('a:summary', '', ns) or '')).strip()
+    authors = [a.findtext('a:name', '', ns) for a in entry.findall('a:author', ns)]
+    cat = entry.find('{http://arxiv.org/schemas/atom}primary_category')
+    return {
+        'arxiv_id': arxiv_id,
+        'title': title,
+        'authors': [a for a in authors if a],
+        'summary': summary,
+        'published': (entry.findtext('a:published', '', ns) or '')[:10],
+        'primary_category': (cat.get('term') if cat is not None else ''),
+        'pdf_url': f'https://arxiv.org/pdf/{arxiv_id}.pdf' if arxiv_id else '',
+        'abs_url': f'https://arxiv.org/abs/{arxiv_id}' if arxiv_id else '',
+    }
+
+
+# ── Free-text neighbour search ────────────────────────────────────
+#
+# ★ arXiv query-syntax facts, MEASURED against the live API (2026-07-28) on six
+# real research ideas. Each of these looked correct in a mock and returned ZERO
+# for all six; they are pinned by offline assertions in
+# tests/test_arxiv_query_syntax.py so the next caller cannot re-learn them the
+# hard way:
+#
+#   1. A QUOTED multi-word value is an exact PHRASE match. `ti:"predictive
+#      delta"` needs those two words adjacent in a title — and a NOVEL idea's
+#      distinguishing phrase is by definition in no existing title. 0 results,
+#      always. Identity terms must be separate unquoted terms.
+#   2. Those terms must be OR-ed, not AND-ed. `ti:predictive AND ti:delta`
+#      demands every identity word in one title: also 0/6 measured.
+#   3. The DOMAIN leg stays a quoted phrase on purpose — it is shared field
+#      vocabulary ("KV cache compression"), and phrase-matching it is what
+#      keeps the search from drifting out of the field.
+#
+# Measured on the fielded form `(ti:a OR ti:b) AND all:"domain"`: 96% on-topic
+# with 0% pairwise overlap across the six ideas, versus 0% on-topic / 80%
+# overlap for a flat prose `all:` query.
+#
+# Deliberately NOT here: deciding WHICH terms are identity vs domain. That
+# needs cross-item batch context (which terms several items share), so it is the
+# caller's strategy layer. This function's contract is "give me terms + a domain
+# constraint, get neighbours back".
+
+#: Characters that break the arXiv query parser. An unescaped `*` in one real
+#: idea produced an HTTP 500, which a bare `except` then swallowed into "no
+#: prior art" — the most dangerous false negative for a novelty check.
+_UNSAFE_QUERY_CHARS = re.compile(r'[*()\[\]{}"\'`,;:!?/\\|<>+=~^$#@&]')
+
+
+def sanitize_terms(terms):
+    """Return `terms` with parser-breaking characters removed.
+
+    Accepts a string or an iterable of strings. Returns a list of clean,
+    non-empty tokens (never None), so a caller cannot accidentally put prose
+    or markup on the wire.
+    """
+    if isinstance(terms, str):
+        terms = terms.split()
+    out = []
+    for t in (terms or []):
+        clean = _UNSAFE_QUERY_CHARS.sub(' ', str(t or ''))
+        out.extend(w for w in clean.split() if w)
+    return out
+
+
+def build_query(identity_terms, domain_terms=None, *, field='ti'):
+    """Build an arXiv `search_query` string; returns ``(query, mode)``.
+
+    ``mode`` is one of:
+      * ``'fielded'`` — ``(ti:a OR ti:b) AND all:"domain"``: both legs present.
+      * ``'domain'``  — ``all:"domain"``: no identity terms, field constraint only.
+      * ``'terms'``   — ``all:"a b"``: no domain constraint available.
+      * ``'empty'``   — nothing usable survived sanitization.
+
+    ``field`` selects the identity leg's arXiv field (``ti`` = title,
+    ``abs`` = abstract). Widening from title to abstract is how a caller can
+    give a genuinely-new idea a second chance before concluding there is no
+    prior art — measured: 2 of 6 real ideas had identity terms too new for ANY
+    title and only found neighbours via the abstract leg.
+    """
+    ident = sanitize_terms(identity_terms)
+    dom = ' '.join(sanitize_terms(domain_terms))
+    if ident and dom:
+        legs = ' OR '.join(f'{field}:{t}' for t in ident)
+        return f'({legs}) AND all:"{dom}"', 'fielded'
+    if dom:
+        return f'all:"{dom}"', 'domain'
+    if ident:
+        # ★ NOT phrase-quoted — Fact 1 applies to this leg too. `all:"a b c d"`
+        # demands those four words ADJACENT somewhere in the record, so a
+        # multi-term free-text query matches almost nothing (measured: the
+        # quoted form returned 0 for a real 5-term idea title that the unquoted
+        # form answers with 5 papers). Unquoted terms are AND-ed by arXiv, which
+        # is the free-text behaviour callers expect.
+        return f'all:{" ".join(ident)}', 'terms'
+    return '', 'empty'
+
+
+def search_by_query(identity_terms, domain_terms=None, *, field='ti',
+                    max_results=5):
+    """Find arXiv papers NEAR a set of terms. Returns a result envelope.
+
+    ★ The return value deliberately distinguishes "asked properly, nothing
+    matched" from "could not ask" — collapsing both into ``[]`` would strip the
+    caller of the signal it needs to decide whether to widen the query. A
+    novelty check that cannot tell those apart will report "no prior art" for a
+    query that was merely too narrow.
+
+    Returns::
+
+        {
+          'ok': bool,          # did the request itself succeed?
+          'query': str,        # exactly what went on the wire
+          'mode': str,         # build_query mode ('fielded'|'domain'|'terms'|'empty')
+          'papers': list,      # parsed papers (possibly empty)
+          'outcome': str,      # 'hits' | 'no_matches' | 'unusable_query' | 'request_failed'
+          'error': str,        # populated only when outcome == 'request_failed'
+        }
+
+    ``outcome`` values:
+      * ``hits``            — the query ran and matched at least one paper.
+      * ``no_matches``      — the query ran and legitimately matched nothing;
+                              widening the field (``ti`` → ``abs``) or dropping
+                              the identity leg is the sensible next step.
+      * ``unusable_query``  — nothing survived sanitization; NOT evidence about
+                              the literature, and no request was made.
+      * ``request_failed``  — transport/parse error; also NOT evidence.
+    """
+    query, mode = build_query(identity_terms, domain_terms, field=field)
+    envelope = {'ok': False, 'query': query, 'mode': mode, 'papers': [],
+                'outcome': 'unusable_query', 'error': ''}
+    if mode == 'empty':
+        logger.warning('[Vertical] arXiv query unusable after sanitization '
+                       '(identity=%r domain=%r)', identity_terms, domain_terms)
+        return envelope
+
+    n = max(1, min(int(max_results or 5), 50))
+    try:
+        resp = base.http_get(
+            'http://export.arxiv.org/api/query',
+            params={'search_query': query, 'start': '0',
+                    'max_results': str(n), 'sortBy': 'relevance',
+                    'sortOrder': 'descending'},
+            headers=_HEADERS, timeout=_TIMEOUT,
+        )
+        if not resp.ok:
+            envelope.update(outcome='request_failed',
+                            error=f'HTTP {resp.status_code}')
+            logger.warning('[Vertical] arXiv query HTTP %s for %r',
+                           resp.status_code, query)
+            return envelope
+        root = ET.fromstring(resp.text)
+    except Exception as e:
+        envelope.update(outcome='request_failed', error=f'{type(e).__name__}: {e}')
+        logger.warning('[Vertical] arXiv query failed for %r: %s', query, e)
+        return envelope
+
+    ns = {'a': 'http://www.w3.org/2005/Atom'}
+    papers = [_parse_entry(en, ns) for en in root.findall('a:entry', ns)]
+    papers = [p for p in papers if p.get('arxiv_id')]
+    envelope.update(ok=True, papers=papers,
+                    outcome='hits' if papers else 'no_matches')
+    logger.info('[Vertical] arXiv query %r (%s) → %d paper(s) [%s]',
+                query, mode, len(papers), envelope['outcome'])
+    return envelope
+
+
 def search(identifier, params):
     """Query arXiv API for paper details."""
     try:
