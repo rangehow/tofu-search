@@ -628,6 +628,25 @@ def _ip_is_blocked(ip_str: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
+def _host_is_allowlisted(host: str) -> bool:
+    """True if ``host`` matches an entry in ``allow_private_hosts``.
+
+    Matches exactly, or as a parent-domain suffix so one entry covers a whole
+    internal zone (``sankuai.com`` admits ``aigc.sankuai.com``). Suffix matching
+    is anchored on a dot boundary, so ``evil-sankuai.com`` does NOT match
+    ``sankuai.com``.
+    """
+    allow = getattr(get_config(), 'allow_private_hosts', None) or ()
+    if not allow:
+        return False
+    host = host.strip().rstrip('.').lower()
+    for entry in allow:
+        entry = str(entry or '').strip().rstrip('.').lower().lstrip('.')
+        if entry and (host == entry or host.endswith('.' + entry)):
+            return True
+    return False
+
+
 def _host_is_safe(host: str) -> bool:
     """Return False if ``host`` resolves to (or literally is) a blocked address.
 
@@ -645,6 +664,11 @@ def _host_is_safe(host: str) -> bool:
         return not _ip_is_blocked(host)
     except ValueError:
         pass
+    # Explicitly allowlisted internal host — checked AFTER the literal-IP
+    # branch so naming a host here can never launder a bare-IP target.
+    if _host_is_allowlisted(host):
+        logger.info('[Fetch] SSRF guard: host %s allowlisted (allow_private_hosts)', host)
+        return True
     # Hostname → resolve all addresses; block if any is internal.
     try:
         infos = socket.getaddrinfo(host, None)
@@ -703,34 +727,58 @@ def looks_like_text_asset(url: str) -> bool:
     return ext in _TEXT_ASSET_EXTS
 
 
-def _should_fetch(url):
+def _should_fetch(url, diag=None):
+    """True when ``url`` may be fetched anonymously.
+
+    ``diag`` is an optional dict the caller passes in to learn WHICH gate
+    refused the URL: on a False return it receives ``reason`` (a stable
+    machine token) and ``detail`` (a human sentence). Without it the function
+    is byte-identical to its historical boolean-only behaviour.
+    """
+    def _refuse(reason, detail):
+        if diag is not None:
+            diag['reason'] = reason
+            diag['detail'] = detail
+        return False
+
     try:
         p = urlparse(url)
         # Reject local file paths that were mistakenly treated as URLs
         if not p.scheme or p.scheme not in ('http', 'https'):
             logger.debug('[Fetch] Skipping non-HTTP URL (scheme=%s): %.80s', p.scheme or 'none', url)
-            return False
+            return _refuse('bad_scheme',
+                           'Not an HTTP(S) URL (scheme=%s).' % (p.scheme or 'none'))
         if not p.netloc:
             logger.debug('[Fetch] Skipping URL with no netloc: %.80s', url)
-            return False
-        if any(s in p.netloc.lower() for s in get_config().skip_domains): return False
+            return _refuse('bad_url', 'URL has no host component.')
+        if any(s in p.netloc.lower() for s in get_config().skip_domains):
+            return _refuse('skip_domain',
+                           'Host %r is on the skip-domains list (JS/social app that '
+                           'yields no extractable text).' % p.netloc)
         # ── SSRF guard: reject hosts that resolve to internal addresses ──
         if get_config().block_private_addresses and not _host_is_safe(p.hostname or ''):
             logger.warning('[Fetch] Skipped (SSRF guard, internal address): %s', url[:80])
-            return False
+            return _refuse('ssrf_blocked',
+                           'Blocked by the SSRF guard: host %r resolves to a private / '
+                           'loopback / reserved address. This is an internal host — add it '
+                           'to allow_private_hosts to fetch it deliberately.'
+                           % (p.hostname or ''))
         # Skip BINARY media (can't be extracted as text). ``.svg`` is text and
         # is handled by the text-asset branch in fetch_page_content, so it is
         # deliberately NOT in this list.
         if any(p.path.lower().endswith(e) for e in
                ('.jpg','.jpeg','.png','.gif','.mp4','.mp3','.zip','.tar','.gz','.exe')):
-            return False
+            return _refuse('binary_media',
+                           'URL points at binary media that carries no extractable text.')
         # 域名级熔断检查
         if _circuit.is_open(url):
             # Expected + self-recovering: the circuit trip itself is already
             # logged at warning; per-URL skips at that level would spam.
             logger.debug('[Fetch] Skipped (circuit open) — %s', url[:80])
-            return False
+            return _refuse('circuit_open',
+                           'Domain circuit-breaker is open after repeated failures; '
+                           'it self-recovers after a cooldown.')
         return True
     except Exception as e:
         logger.warning('Exception in guard clause for URL filter: %s', e, exc_info=True)
-        return False
+        return _refuse('guard_error', 'URL guard raised %s: %s' % (type(e).__name__, e))

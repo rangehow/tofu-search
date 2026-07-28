@@ -84,7 +84,24 @@ def _mk_deadline_playwright(budget_blown):
 
 
 def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
-                       deadline_secs=None):
+                       deadline_secs=None, diag=None):
+    """Fetch ``url`` and return extracted text, or ``None`` on failure.
+
+    ``diag``: an optional dict the caller passes IN to learn why a ``None``
+    came back. The pipeline knows the cause (SSRF-blocked, skip-domain,
+    circuit-open, HTTP status, timeout, SPA shell, login wall, deadline) but the
+    ``str | None`` return threw it away, so every distinct failure surfaced to
+    the model as one indistinguishable "Failed to fetch". On return it carries
+    ``reason`` (a stable machine token) and ``detail`` (a human sentence).
+    Passing nothing preserves the historical signature exactly.
+    """
+    def _diag(reason, detail):
+        """Record the failure cause; always returns None so callers can `return _diag(...)`."""
+        if diag is not None:
+            diag['reason'] = reason
+            diag['detail'] = detail
+        return None
+
     cfg = get_config()
     if max_chars is None: max_chars = cfg.fetch_max_chars_search
     if pdf_max_chars is None: pdf_max_chars = cfg.fetch_max_chars_pdf
@@ -178,8 +195,18 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
     # ── Skip-domain / SSRF / binary-media / circuit gate ──
     # After the reader + auth-source bypasses so a connected or reader-handled
     # URL is not blunt-blocked, but before any anonymous network request.
-    if not _should_fetch(url):
-        return None
+    # `diag` is passed positionally-optional: _should_fetch is a documented
+    # monkeypatch seam (tests and hosts substitute a 1-arg predicate), so a
+    # replacement that does not accept the out-param must still work — the
+    # gate's VERDICT is the contract, its diagnostics are a bonus.
+    _gate = {}
+    try:
+        _allowed = _should_fetch(url, diag=_gate)
+    except TypeError:
+        _allowed = _should_fetch(url)
+    if not _allowed:
+        return _diag(_gate.get('reason', 'refused'),
+                     _gate.get('detail', 'URL refused before any request was made.'))
 
     # ── Known SPA domains: skip requests, go straight to Playwright ──
     if _is_known_spa(url):
@@ -208,6 +235,8 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
                 browser_text = _try_browser_fetch(url, max_chars, reason='HTTP %d' % e.status_code)
                 if browser_text:
                     return browser_text
+            return _diag('http_%d' % e.status_code,
+                         'Server returned HTTP %d (%s).' % (e.status_code, label))
         else:
             _circuit.record_failure(url)
             logger.warning('HTTP %d — %s', e.status_code, url[:120])
@@ -217,7 +246,8 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
                     logger.info('[Fetch] Browser fallback OK after HTTP %d — %s (%d chars)',
                                 e.status_code, url[:80], len(browser_text))
                     return browser_text
-        return None
+        return _diag('http_%d' % e.status_code,
+                     'Server returned HTTP %d.' % e.status_code)
     except requests.exceptions.SSLError as e:
         is_legacy_renegotiation = 'UNSAFE_LEGACY_RENEGOTIATION' in str(e)
         if is_legacy_renegotiation and _HAS_LEGACY_SSL:
@@ -259,7 +289,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             logger.info('[Fetch] Browser fallback OK after timeout — %s (%d chars)',
                         url[:80], len(browser_text))
             return browser_text
-        return None
+        return _diag('timeout', 'Host did not respond within %ds.' % timeout)
     except requests.exceptions.ConnectionError as e:
         err_str = str(e).lower()
         if 'pool is closed' in err_str:
@@ -277,7 +307,7 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             logger.info('[Fetch] Browser fallback OK after ConnectionError — %s (%d chars)',
                         url[:80], len(browser_text))
             return browser_text
-        return None
+        return _diag('connection_error', 'Could not connect to the host: %s' % str(e)[:200])
     except requests.exceptions.ContentDecodingError as e:
         _circuit.record_failure(url)
         logger.warning('ContentDecodingError (both attempts failed) — %s: %s', url[:80], e)
@@ -353,7 +383,9 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         if browser_text:
             return browser_text
         logger.debug('Playwright also failed for bot page — %s', url[:80])
-        return None
+        return _diag('bot_wall',
+                     'Blocked by bot protection / a login wall; JS rendering and the '
+                     'browser fallback also failed to get past it.')
 
     # ── SPA-shell detection: HTML present but too little extracted text ──
     if not is_pdf and html_for_spa_check and _looks_like_spa_shell(html_for_spa_check, result):
@@ -374,7 +406,10 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             if max_chars and len(result) > max_chars:
                 return result[:max_chars] + '\n[…truncated]'
             return result
-        return None
+        return _diag('spa_shell',
+                     'Page is a JavaScript shell: the server returned HTTP 200 with no '
+                     'readable text, and JS rendering plus the browser fallback both '
+                     'yielded nothing (often a login-walled single-page app).')
 
     if result and len(result) > 50:
         _fetch_cache.put(url, result)
@@ -383,7 +418,10 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             return result[:max_chars] + '\n[…truncated]'
         return result
     logger.debug('Empty result (len=%d) — %s', len(result) if result else 0, url[:80])
-    return None
+    return _diag('empty_extract',
+                 'Fetched the page, but text extraction produced %d chars (below the '
+                 '50-char floor) — likely a redirect stub or a near-empty page.'
+                 % (len(result) if result else 0))
 
 
 # ═══════════════════════════════════════════════════════

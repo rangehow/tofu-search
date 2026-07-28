@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.3
+
+### Added
+- **`allow_private_hosts` — an explicit, HOSTNAME-anchored SSRF exemption.**
+  The SSRF guard (`block_private_addresses`) is unconditional, so an internal
+  host was unreachable no matter how deliberately the operator wanted it. The
+  only way through was a side effect: a registered auth-source short-circuits
+  the gate, which meant *connecting an account silently granted an SSRF
+  exemption* — a permission travelling on the wrong noun. `allow_private_hosts`
+  makes the intent first-class and keeps the two gates separate.
+  Anchored on the HOSTNAME, never the resolved IP: an internal load balancer
+  rotates its address between lookups (one host was observed answering as both
+  `10.176.18.71` and `10.192.19.176` minutes apart), so an IP allowlist rots
+  silently while the hostname stays true. Matching is exact or parent-suffix on
+  a DOT BOUNDARY (`sankuai.com` admits `aigc.sankuai.com`, but never
+  `evil-sankuai.com`), and it is consulted AFTER the literal-IP branch so
+  naming a host can never launder a bare-IP target. Default empty ⇒ byte-identical
+  to 0.5.2.
+- **Failure-reason propagation (`diag` out-param).** `fetch_page_content()`
+  returned `str | None`, so SSRF-blocked / skip-domain / circuit-open / HTTP
+  status / timeout / SPA-shell / bot-wall all collapsed into one
+  indistinguishable "Failed to fetch" at the tool surface — the pipeline knew
+  the cause and threw it away. Callers may now pass `diag={}` to receive
+  `reason` (stable token) and `detail` (human sentence). `_should_fetch()`
+  gained the same optional out-param. Both are strictly additive: the parameter
+  is optional, and the `_should_fetch` monkeypatch seam tolerates a substituted
+  1-arg predicate, so existing callers and test doubles are unaffected.
+- Tests: `tests/test_ssrf_allowlist.py` (19) — default posture unchanged,
+  admission by exact/suffix entry, IP-independence across LB rotation, and the
+  security boundaries (dot-boundary anchoring vs `evil-sankuai.com`, bare
+  private/loopback/metadata IPs never admitted, blank entries never degrading
+  into allow-all). Neuter-verified: removing the allowlist hook turns exactly
+  the 4 admission tests red while all 15 boundary tests stay green.
+
 ## 0.5.2
 
 ### Added

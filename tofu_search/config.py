@@ -84,6 +84,14 @@ class SearchConfig:
     # When a TLS certificate cannot be verified, retry with verification
     # DISABLED. Off by default — enabling exposes those fetches to MITM.
     allow_insecure_ssl_fallback: bool = False
+    # Hostnames exempted from the SSRF guard — the explicit way to say "I do
+    # mean to fetch this internal host". Matched on the HOSTNAME (exact, or as
+    # a parent suffix: 'sankuai.com' covers 'aigc.sankuai.com'), never on the
+    # resolved IP: an internal load balancer rotates its address between
+    # lookups, so an IP allowlist silently rots. Bare IPs are still checked
+    # against the numeric guard, so a literal-IP URL cannot slip through by
+    # naming a host here. Empty (default) = every private target stays blocked.
+    allow_private_hosts: set = field(default_factory=set)
 
     # ── Domains to skip (media, social, etc.) ──
     skip_domains: set = field(default_factory=lambda: {
@@ -105,6 +113,22 @@ class SearchConfig:
         'https://search.hbubli.cc',
         'https://opnxng.com',
     ])
+
+    # ── Travel vertical (RollingGo / 道旅 MCP) ──
+    # Credential for the RollingGo hotel + flight MCP endpoints. Read from the
+    # environment at dataclass-construction time — NOT only inside configure()
+    # — because a host that never calls configure() would otherwise never pick
+    # the key up. The hotel endpoint requires it; the flight endpoint currently
+    # serves anonymous callers, so availability is decided per TYPE (see
+    # search/vertical/travel_flight.py) rather than for the whole domain.
+    rollinggo_api_key: str = field(
+        default_factory=lambda: os.environ.get('ROLLINGGO_API_KEY', ''))
+    rollinggo_hotel_endpoint: str = 'https://mcp.rollinggo.cn/mcp'
+    rollinggo_flight_endpoint: str = 'https://mcp.rollinggo.cn/mcp/flight'
+    # Travel lookups are multi-hop (airport resolve → flight search) against a
+    # live inventory API, so they need a longer ceiling than the 10s the
+    # metadata verticals use — but still well inside search_deadline_secs.
+    vertical_travel_timeout: int = 25
 
     # ── LLM configuration for content filter ──
     # Option A: OpenAI-compatible endpoint
@@ -188,6 +212,7 @@ def configure(**kwargs) -> SearchConfig:
             'TOFU_SEARCH_PROXY_URL': ('proxy_url', str),
             'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
             'TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS': ('min_request_interval_ms', int),
+            'ROLLINGGO_API_KEY': ('rollinggo_api_key', str),
         }
 
         # Apply env var defaults (only for fields not explicitly set by user)
