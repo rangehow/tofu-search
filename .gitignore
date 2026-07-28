@@ -25,6 +25,8 @@ Thumbs.db
 
 # Project-specific
 .chatui/
-.tofu/
-.tofu_trash/
 *.log
+# AI assistant runtime artifacts (file-history, trash, sandbox)
+.tofu*
+# AI assistant evolution journal (per-developer, not source)
+JOURNAL.md
