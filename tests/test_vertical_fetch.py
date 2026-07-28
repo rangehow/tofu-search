@@ -4,8 +4,9 @@ and the LLM content-filter worker cap.
 
 import pytest
 
-from tofu_search.search.vertical import _FETCH_FAILED, _fetch_json, base
+from tofu_search.search.vertical import base
 from tofu_search.search.vertical import npm as npm_mod
+from tofu_search.search.vertical.base import _FETCH_FAILED, _fetch_json
 
 
 class FakeResp:

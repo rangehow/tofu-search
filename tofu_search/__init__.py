@@ -32,7 +32,16 @@ Usage::
     text = format_results(results)
 """
 
-__version__ = '0.5.2'
+# Single source of truth: the version lives ONLY in pyproject.toml and is read
+# back from the installed distribution metadata. Hard-coding it here too meant
+# two places to bump, and one release shipped with them out of sync.
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version('tofu-search')
+except PackageNotFoundError:  # running from a source tree, not installed
+    __version__ = '0.0.0.dev0'
 
 from tofu_search.config import SearchConfig, configure, get_config
 from tofu_search.fetch.core import (
@@ -52,6 +61,7 @@ from tofu_search.providers import (
 from tofu_search.search.format import format_search_for_tool_response as format_results
 from tofu_search.search.orchestrator import perform_web_search
 from tofu_search.search.vertical import (
+    describe_domains,
     detect_vertical_intent,
     list_domains,
     search_vertical,
@@ -84,6 +94,7 @@ __all__ = [
     'search_vertical',
     'search_vertical_domain',
     'list_domains',
+    'describe_domains',
     # Citation verification (reference hallucination detection)
     'verify_bibtex',
     'verify_references',

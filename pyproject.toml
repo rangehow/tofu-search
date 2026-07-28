@@ -35,6 +35,12 @@ dependencies = [
     # serialized under _TRAFILATURA_LOCK in fetch/html_extract.py. Pinned here
     # with a floor >=5.3 to keep a known-good version resolved; do NOT switch
     # any bs4 construction to the 'lxml' parser.
+    #
+    # That lock is a PROCESS-GLOBAL serialization point. At the library's own
+    # concurrency (a 16-thread fetch pool dominated by network I/O) it costs a
+    # few ms per page and is unmeasurable. Serving this package concurrently
+    # multiplies extraction calls by the number of in-flight requests, so the
+    # lock's cost must be re-measured before assuming it stays negligible.
     "lxml>=5.3",
 ]
 
@@ -42,7 +48,6 @@ dependencies = [
 playwright = ["playwright>=1.49"]
 pdf = ["pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
 all = ["playwright>=1.49", "pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
-server = ["flask>=3.0"]
 test = ["pytest>=8.0", "pytest-cov>=4.1"]
 dev = ["pytest>=8.0", "pytest-cov>=4.1", "ruff>=0.6"]
 
