@@ -226,6 +226,87 @@ def test_hits_are_parsed_into_papers(monkeypatch):
     assert p['abs_url'].endswith('/abs/2401.00001')
 
 
+# ── Transient failures must not read as "no prior art" ──
+
+_FEED_ONE = '''<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.00001v1</id>
+    <title>A Paper</title>
+  </entry>
+</feed>'''
+
+
+class _Resp:
+    def __init__(self, status, text=''):
+        self.status_code = status
+        self.ok = status == 200
+        self.text = text
+
+
+def test_rate_limited_request_is_retried_and_can_recover(monkeypatch):
+    """★ arXiv answers bursts with HTTP 429. Retry lives in THIS function, not
+    in any one caller.
+
+    The novelty gate calls `search_by_query` DIRECTLY (it has structured legs
+    to pass and must not flatten them through a free-text adapter). Backoff
+    placed in an adapter therefore protects every caller EXCEPT the one whose
+    correctness depends on retrieval — measured: a 429 burst left 3 of 6 real
+    ideas with an empty basis, which reads identically to "no prior art
+    exists", the worst false positive a novelty check can emit.
+    """
+    calls = []
+    monkeypatch.setattr(arxiv.time, 'sleep', lambda s: None)
+
+    def _flaky(*a, **k):
+        calls.append(1)
+        return _Resp(429) if len(calls) < 3 else _Resp(200, _FEED_ONE)
+
+    monkeypatch.setattr(arxiv.base, 'http_get', _flaky)
+    res = arxiv.search_by_query(['predictive', 'delta'], ['KV', 'cache'])
+
+    assert len(calls) == 3, f'expected retries after 429, got {len(calls)} call(s)'
+    assert res['ok'] is True
+    assert res['outcome'] == 'hits', res
+    assert res['error'] == '', 'a recovered request must not report a stale error'
+
+
+def test_exhausted_retries_still_report_request_failed_not_no_matches(monkeypatch):
+    """Counter-case: when every attempt fails the verdict must stay
+    `request_failed`. Degrading it to `no_matches` would tell the caller the
+    literature is empty — a statement the failed request never supported."""
+    calls = []
+    monkeypatch.setattr(arxiv.time, 'sleep', lambda s: None)
+
+    def _always_429(*a, **k):
+        calls.append(1)
+        return _Resp(429)
+
+    monkeypatch.setattr(arxiv.base, 'http_get', _always_429)
+    res = arxiv.search_by_query(['predictive'], ['KV', 'cache'])
+
+    assert len(calls) == arxiv._SEARCH_RETRIES, calls
+    assert res['ok'] is False
+    assert res['outcome'] == 'request_failed', res
+    assert res['papers'] == []
+
+
+def test_a_clean_empty_result_is_not_retried(monkeypatch):
+    """`no_matches` is a real answer about the literature, so retrying it just
+    burns the rate limit that caused the problem in the first place."""
+    calls = []
+    monkeypatch.setattr(arxiv.time, 'sleep', lambda s: None)
+
+    def _empty(*a, **k):
+        calls.append(1)
+        return _Resp(200, '<feed xmlns="http://www.w3.org/2005/Atom"/>')
+
+    monkeypatch.setattr(arxiv.base, 'http_get', _empty)
+    res = arxiv.search_by_query(['predictive'], ['KV', 'cache'])
+
+    assert len(calls) == 1, f'a legitimate zero was retried {len(calls)}×'
+    assert res['outcome'] == 'no_matches', res
+
+
 # ── Single-source-of-truth: no third arXiv HTTP path ──
 
 def test_query_path_reuses_the_shared_http_helper():

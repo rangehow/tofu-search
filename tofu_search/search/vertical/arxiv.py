@@ -1,6 +1,7 @@
 """arXiv vertical — paper metadata via the arXiv Atom API."""
 
 import re
+import time
 import xml.etree.ElementTree as ET
 
 from tofu_search.search.vertical import base
@@ -134,6 +135,19 @@ def build_query(identity_terms, domain_terms=None, *, field='ti'):
     return '', 'empty'
 
 
+#: arXiv rate-limits aggressively (HTTP 429) and occasionally times out.
+#: Retry lives HERE, in the shared vertical, rather than in any one caller:
+#: the novelty gate calls this directly (it has structured legs to pass and
+#: must not flatten them through a free-text adapter), so putting backoff in
+#: an adapter leaves the ONE caller whose correctness depends on retrieval
+#: with no resilience at all. Measured: a burst of 429s made 3 of 6 real ideas
+#: report an empty prior-art basis — which reads exactly like "nothing has been
+#: published on this", the most dangerous false positive a novelty check can
+#: produce.
+_SEARCH_RETRIES = 3
+_SEARCH_RETRY_SLEEP = 3.0
+
+
 def search_by_query(identity_terms, domain_terms=None, *, field='ti',
                     max_results=5):
     """Find arXiv papers NEAR a set of terms. Returns a result envelope.
@@ -173,25 +187,40 @@ def search_by_query(identity_terms, domain_terms=None, *, field='ti',
         return envelope
 
     n = max(1, min(int(max_results or 5), 50))
-    try:
-        resp = base.http_get(
-            'http://export.arxiv.org/api/query',
-            params={'search_query': query, 'start': '0',
-                    'max_results': str(n), 'sortBy': 'relevance',
-                    'sortOrder': 'descending'},
-            headers=_HEADERS, timeout=_TIMEOUT,
-        )
-        if not resp.ok:
+    root = None
+    for attempt in range(1, _SEARCH_RETRIES + 1):
+        try:
+            resp = base.http_get(
+                'http://export.arxiv.org/api/query',
+                params={'search_query': query, 'start': '0',
+                        'max_results': str(n), 'sortBy': 'relevance',
+                        'sortOrder': 'descending'},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            )
+            if not resp.ok:
+                envelope.update(outcome='request_failed',
+                                error=f'HTTP {resp.status_code}')
+                logger.warning('[Vertical] arXiv query HTTP %s for %r '
+                               '(attempt %d/%d)', resp.status_code, query,
+                               attempt, _SEARCH_RETRIES)
+            else:
+                root = ET.fromstring(resp.text)
+                envelope['error'] = ''
+                break
+        except Exception as e:
             envelope.update(outcome='request_failed',
-                            error=f'HTTP {resp.status_code}')
-            logger.warning('[Vertical] arXiv query HTTP %s for %r',
-                           resp.status_code, query)
-            return envelope
-        root = ET.fromstring(resp.text)
-    except Exception as e:
-        envelope.update(outcome='request_failed', error=f'{type(e).__name__}: {e}')
-        logger.warning('[Vertical] arXiv query failed for %r: %s', query, e)
+                            error=f'{type(e).__name__}: {e}')
+            logger.warning('[Vertical] arXiv query failed for %r '
+                           '(attempt %d/%d): %s', query, attempt,
+                           _SEARCH_RETRIES, e)
+        if attempt < _SEARCH_RETRIES:
+            time.sleep(_SEARCH_RETRY_SLEEP * attempt)  # linear backoff
+
+    if root is None:
         return envelope
+    if attempt > 1:
+        logger.info('[Vertical] arXiv query %r recovered on attempt %d',
+                    query, attempt)
 
     ns = {'a': 'http://www.w3.org/2005/Atom'}
     papers = [_parse_entry(en, ns) for en in root.findall('a:entry', ns)]
