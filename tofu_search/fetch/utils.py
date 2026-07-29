@@ -397,6 +397,51 @@ _BOT_TEXT_PATTERNS = (
 )
 
 
+_LOGIN_WALL_PATTERNS = (
+    # URL / host markers that land in extracted text of SSO redirect pages
+    'ssosv.', 'sson/login', '/sso/web/auth', 'passport.', 'accounts.google',
+    # Technical fingerprints of an SSO login bundle. These matter because a
+    # login page can be LONG (the observed one extracts to ~1900 chars, mostly
+    # inlined bootstrap JS) while carrying only ONE human-readable login phrase
+    # — corroboration has to come from somewhere, and the auth bundle's own
+    # identifiers are the most reliable second witness.
+    'sso.auth.fe', 'qr code login', 'code_challenge',
+    "get('client_id')", 'localstorage.getitem(\'_username\')',
+    # English login-form vocabulary
+    'forgot password', 'login center', 'sign in to continue',
+    'log in to continue', 'please log in', 'please sign in',
+    # Chinese login-form vocabulary
+    '忘记密码', '二维码登录', '扫码登录', '登录您的账号', '请先登录',
+    '账号登录', '密码登录', '登录后查看',
+)
+
+
+def _looks_like_login_wall(text):
+    """True when extracted text is a login/SSO wall rather than page content.
+
+    A login wall is a COMPLETE page, so "we got non-empty text" cannot
+    distinguish it from a successful fetch — that conflation is what made an
+    authenticated replay report the wall as its result. The judgement is
+    therefore on the CONTENT, and length-bounded: a real article that merely
+    mentions "忘记密码" in passing must not be misread as a wall, whereas a
+    genuine wall is short (the observed SSO page extracts to ~25-1900 chars).
+
+    Two or more independent markers are required past the very-short range, so
+    a single incidental phrase in a longer page cannot trip it.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) > 4000:          # real content — never a bare wall
+        return False
+    lower = stripped.lower()
+    hits = [p for p in _LOGIN_WALL_PATTERNS if p in lower]
+    if not hits:
+        return False
+    # Very short + any marker = wall. Longer = demand corroboration.
+    return len(stripped) <= 600 or len(hits) >= 2
+
+
 def _is_bot_extracted_text(text):
     """Detect bot-protection pages from *extracted* text (post-extraction).
 

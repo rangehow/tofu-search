@@ -38,6 +38,7 @@ from tofu_search.fetch.utils import (
     _is_bot_protection,
     _is_known_spa,
     _is_text_asset_ct,
+    _looks_like_login_wall,
     _looks_like_spa_shell,
     _normalize_code_hosting_url,
     _session,
@@ -178,6 +179,18 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         logger.debug('[Fetch] auth-source match domain=%s — %s',
                      _auth_src.get('domain'), url[:80])
         auth_text = _try_authenticated_fetch(url, _auth_src, max_chars, timeout)
+        # A NON-EMPTY result is not the same as a SUCCESSFUL one: an SSO login
+        # wall is itself a full page, so returning it here reported the replay
+        # as a success and made the browser escalation below UNREACHABLE. The
+        # caller then got the wall as if it were the article. Judge the CONTENT.
+        if auth_text and _looks_like_login_wall(auth_text):
+            logger.info('[Fetch] auth-source replay returned a LOGIN WALL (%d chars) '
+                        '— stored cookies were not accepted by the site; '
+                        'escalating to the host browser — %s', len(auth_text), url[:80])
+            auth_text = None
+            _auth_wall = True
+        else:
+            _auth_wall = False
         if auth_text:
             return auth_text
         logger.info('[Fetch] auth-source fetch yielded nothing, falling back '
@@ -186,11 +199,26 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         # is still valid — a registered source means this domain is known to be
         # login-walled, so the anonymous pipeline below is near-certain to hit
         # the same wall. Try the host browser first (no-op when unconnected).
-        browser_text = _try_browser_fetch(url, max_chars, reason='auth_source_failed')
+        browser_text = _try_browser_fetch(
+            url, max_chars,
+            reason='auth_source_login_wall' if _auth_wall else 'auth_source_failed')
         if browser_text:
             logger.info('[Fetch] Browser fallback OK after auth-source failure — %s (%d chars)',
                         url[:80], len(browser_text))
             return browser_text
+        if _auth_wall:
+            # The replay hit a wall AND the browser could not take over. Report
+            # the actionable cause instead of letting the anonymous pipeline
+            # return the same wall as a "successful" fetch.
+            return _diag(
+                'auth_replay_rejected',
+                'Stored credentials were sent but the site did not accept them, and '
+                'the host browser is not available to take over. Some sites (e.g. an '
+                'SSO whose page JS re-assembles the ticket before sending) never '
+                'accept a cookie COPIED from devtools — the stored value is not the '
+                'value the browser transmits — so re-pasting cookies cannot fix this. '
+                'Connect the Tofu browser extension so the fetch runs inside your '
+                'own logged-in session, or use the site\'s API with a long-lived token.')
 
     # ── Skip-domain / SSRF / binary-media / circuit gate ──
     # After the reader + auth-source bypasses so a connected or reader-handled
