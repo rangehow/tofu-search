@@ -9,9 +9,16 @@ Why a separate, short-lived browser (not the pool)? The fetch pool launches
 ``headless=True`` and is shared across fetches — it can't be shown to the
 user. Interactive login is a rare, user-initiated, one-at-a-time action.
 
-Availability: requires a display on the host. On a headless box the launch
-raises and we return ``{'ok': False, 'reason': 'unavailable'}``. Set
-``TOFU_INTERACTIVE_LOGIN=0`` to force-disable.
+Availability: requires a display on the host AND a Chromium build that can
+open a window. The latter is NOT implied by "Playwright is installed": Tofu's
+installers deliberately fetch ``--only-shell`` (-60% download), and
+chrome-headless-shell has NO headed mode — it is a separate, smaller binary,
+not a flag. Launching headed against a shell-only install fails with
+"Executable doesn't exist at .../chromium-<rev>/chrome-linux64/chrome" plus
+Playwright's "just installed or updated" banner, which sends the reader off to
+reinstall something already correctly installed. So we check for a headed-
+capable binary up front and return a truthful, actionable reason instead.
+Set ``TOFU_INTERACTIVE_LOGIN=0`` to force-disable.
 """
 
 from __future__ import annotations
@@ -36,16 +43,74 @@ _LOGIN_COOKIE_HINTS = {
 }
 
 
+#: Actionable recovery for a shell-only install. Names the exact command,
+#: because the raw Playwright error names the WRONG one (it tells you to run
+#: `playwright install`, which is what produced this state).
+_HEADED_MISSING_MSG = (
+    'Interactive login needs a Chromium that can open a window, but only the '
+    'headless shell is installed (chrome-headless-shell has no headed mode). '
+    'Install the full build with:  python -m playwright install chromium'
+)
+
+
+def _headed_chromium_path() -> str:
+    """Path to a Chromium that can open a VISIBLE window, or '' if none.
+
+    Delegates to the Tofu host's ``chromium_env`` when importable (single
+    source of truth, guard-covered there). tofu_search ships independently, so
+    the fallback repeats only the minimal rule: a build whose binary is named
+    ``chrome-headless-shell`` cannot go headed; anything else can.
+    """
+    try:
+        from chromium_env import headed_chromium_executable
+        return headed_chromium_executable()
+    except Exception as e:
+        logger.debug('[Login] host chromium_env unavailable: %s', e)
+    import glob
+    import shutil
+    roots = []
+    env_root = (os.environ.get('PLAYWRIGHT_BROWSERS_PATH') or '').strip()
+    if env_root and env_root != '0':
+        roots.append(env_root)
+    else:
+        home = os.path.expanduser('~')
+        roots += [os.path.join(home, '.cache', 'ms-playwright'),
+                  os.path.join(home, 'Library', 'Caches', 'ms-playwright'),
+                  os.path.join(home, 'AppData', 'Local', 'ms-playwright')]
+    for root in roots:
+        for pat in ('chromium-*/chrome-linux64/chrome',
+                    'chromium-*/chrome-linux/chrome',
+                    'chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium',
+                    'chromium-*/chrome-win*/chrome.exe'):
+            for hit in sorted(glob.glob(os.path.join(root, pat)), reverse=True):
+                if os.path.isfile(hit):
+                    return hit
+    for name in ('google-chrome', 'google-chrome-stable', 'chromium',
+                 'chromium-browser', 'microsoft-edge'):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ''
+
+
 def is_interactive_login_available() -> bool:
-    """Best-effort check: is headful login plausibly usable here?"""
+    """Best-effort check: is headful login plausibly usable here?
+
+    Checks for a HEADED-CAPABLE binary, not merely that Playwright imports.
+    The old check (``HAS_PLAYWRIGHT`` alone) was constitutionally incapable of
+    failing for the reason that actually breaks this feature on a shell-only
+    install, so it reported the feature available and then died at launch.
+    """
     if os.environ.get('TOFU_INTERACTIVE_LOGIN', '').strip() == '0':
         return False
     try:
         from tofu_search.fetch.utils import HAS_PLAYWRIGHT
-        return bool(HAS_PLAYWRIGHT)
+        if not HAS_PLAYWRIGHT:
+            return False
     except Exception as e:
         logger.debug('[Login] availability check failed: %s', e)
         return False
+    return bool(_headed_chromium_path())
 
 
 def capture_login_cookies(domain: str, login_url: str, timeout_s: int = 180) -> dict:
@@ -59,8 +124,21 @@ def capture_login_cookies(domain: str, login_url: str, timeout_s: int = 180) -> 
     ``reason`` is ``'unavailable'`` / ``'timeout'`` / ``'busy'`` / ``'error'``.
     """
     if not is_interactive_login_available():
-        return {'ok': False, 'reason': 'unavailable',
-                'error': 'Interactive login disabled or Playwright not installed'}
+        # Distinguish the two causes: "disabled / no Playwright" is a different
+        # fix from "only the headless shell is installed", and collapsing them
+        # into one message is what made this failure unreadable.
+        if os.environ.get('TOFU_INTERACTIVE_LOGIN', '').strip() == '0':
+            return {'ok': False, 'reason': 'unavailable',
+                    'error': 'Interactive login disabled (TOFU_INTERACTIVE_LOGIN=0)'}
+        try:
+            from tofu_search.fetch.utils import HAS_PLAYWRIGHT
+        except Exception:
+            HAS_PLAYWRIGHT = False
+        if not HAS_PLAYWRIGHT:
+            return {'ok': False, 'reason': 'unavailable',
+                    'error': 'Playwright is not installed'}
+        return {'ok': False, 'reason': 'headed_unavailable',
+                'error': _HEADED_MISSING_MSG}
 
     if not _login_lock.acquire(blocking=False):
         return {'ok': False, 'reason': 'busy',
@@ -90,6 +168,14 @@ def _run_capture(domain: str, login_url: str, timeout_s: int) -> dict:
         try:
             browser = pw.chromium.launch(headless=False, args=['--no-sandbox'])
         except Exception as e:
+            # A shell-only install produces Playwright's "just installed or
+            # updated" banner here, which is actively misleading — running
+            # `playwright install` again is exactly what created this state.
+            # Say what is really wrong when we can tell.
+            if not _headed_chromium_path():
+                logger.warning('[Login] no headed-capable Chromium for %s: %s', domain, e)
+                return {'ok': False, 'reason': 'headed_unavailable',
+                        'error': _HEADED_MISSING_MSG}
             logger.warning('[Login] headful launch failed (no display?) for %s: %s', domain, e)
             return {'ok': False, 'reason': 'unavailable', 'error': str(e)}
 

@@ -31,65 +31,119 @@ _DEFAULT_UA = (
 )
 
 
-def _ensure_chromium_library_path():
-    """Augment LD_LIBRARY_PATH so Chromium can find its shared-library deps.
+#: Libs whose presence proves a directory really carries Chromium's GUI deps.
+#: Used only by the FALLBACK below; the host's chromium_env owns the real rule.
+_SENTINEL_LIBS = (
+    'libatk-1.0.so.0', 'libatk-bridge-2.0.so.0', 'libnss3.so',
+    'libgbm.so.1', 'libxkbcommon.so.0',
+)
 
-    On Linux systems without sudo (e.g. CentOS 7 HPC nodes), users can't run
-    ``playwright install-deps`` to install Chromium's X11/GTK dependencies
-    (libatk, libgbm, libXcomposite, …) system-wide. Instead, we install them
-    via conda-forge into the active conda env. Those libs live under
-    ``$CONDA_PREFIX/lib`` and (for cos7-compat packages) the gcc sysroot at
-    ``$CONDA_PREFIX/x86_64-conda-linux-gnu/sysroot/usr/lib64``.
 
-    Chromium is a child subprocess of the Python process, so it inherits
-    ``LD_LIBRARY_PATH`` from ``os.environ``. We mutate os.environ once
-    before the first browser launch so subprocesses see the conda paths.
+def _fallback_prefix_candidates():
+    """Prefixes that may hold Chromium's GUI libs, most-authoritative first.
 
-    No-op on macOS/Windows (uses DYLD_LIBRARY_PATH / DLL search paths which
-    Playwright already handles via its own bundled binaries).
-
-    Users can override detection via CHROMIUM_EXTRA_LIB_DIRS (colon-separated).
+    ``sys.prefix`` FIRST and ``$CONDA_PREFIX`` only as a late fallback. This
+    ordering is the whole point: ``sys.prefix`` is a property of the RUNNING
+    INTERPRETER, so it is correct for conda envs, uv venvs and plain
+    virtualenvs alike and cannot be un-set by the shell. ``$CONDA_PREFIX`` is
+    set only by ``conda activate`` — measured 2026-07-29 on the dev host it is
+    EMPTY, which made the previous implementation a silent no-op.
     """
-    # Linux-only — macOS/Windows use different mechanisms
-    import sys as _sys
-    if not _sys.platform.startswith('linux'):
-        return
+    out = []
+    for cand in (sys.prefix, getattr(sys, 'base_prefix', ''),
+                 os.environ.get('CONDA_PREFIX', '')):
+        cand = (cand or '').strip()
+        if cand and cand not in out:
+            out.append(cand)
+    return out
 
-    extra_dirs: list[str] = []
 
-    # 1. Explicit override via env var
-    override = os.environ.get('CHROMIUM_EXTRA_LIB_DIRS', '').strip()
-    if override:
-        extra_dirs.extend(p for p in override.split(':') if p)
+def _fallback_ensure_chromium_env():
+    """Stand-alone copy of the host's rule, used when chromium_env is absent.
 
-    # 2. Auto-detect conda env
-    conda_prefix = os.environ.get('CONDA_PREFIX', '').strip()
-    if conda_prefix and os.path.isdir(conda_prefix):
-        lib_dir = os.path.join(conda_prefix, 'lib')
-        if os.path.isdir(lib_dir):
+    tofu_search ships independently of the Tofu app, so it cannot REQUIRE the
+    host module — but when it is importable that module is authoritative and
+    this function never runs. Kept deliberately small: candidate prefixes are
+    accepted only on EVIDENCE (a sentinel lib is really there), never inferred
+    from a directory's shape.
+    """
+    # ── LD_LIBRARY_PATH (Linux-only; macOS/Windows use other mechanisms) ──
+    if sys.platform.startswith('linux'):
+        extra_dirs = []
+        override = os.environ.get('CHROMIUM_EXTRA_LIB_DIRS', '').strip()
+        if override:
+            extra_dirs.extend(p for p in override.split(os.pathsep) if p)
+        for prefix in _fallback_prefix_candidates():
+            lib_dir = os.path.join(prefix, 'lib')
+            if lib_dir in extra_dirs or not os.path.isdir(lib_dir):
+                continue
+            if not any(os.path.isfile(os.path.join(lib_dir, s))
+                       for s in _SENTINEL_LIBS):
+                continue
             extra_dirs.append(lib_dir)
-        # cos7 sysroot (used by mesa-libgbm-cos7-x86_64 etc.)
-        sysroot_lib = os.path.join(
-            conda_prefix, 'x86_64-conda-linux-gnu', 'sysroot', 'usr', 'lib64'
-        )
-        if os.path.isdir(sysroot_lib):
-            extra_dirs.append(sysroot_lib)
+            sysroot_lib = os.path.join(
+                prefix, 'x86_64-conda-linux-gnu', 'sysroot', 'usr', 'lib64')
+            if os.path.isdir(sysroot_lib) and sysroot_lib not in extra_dirs:
+                extra_dirs.append(sysroot_lib)
+        current = os.environ.get('LD_LIBRARY_PATH', '')
+        current_parts = [p for p in current.split(os.pathsep) if p]
+        new_parts = [d for d in extra_dirs if d not in current_parts]
+        if new_parts:
+            os.environ['LD_LIBRARY_PATH'] = os.pathsep.join(
+                new_parts + current_parts)
+            logger.info('[Playwright] LD_LIBRARY_PATH += %d GUI lib dir(s): %s',
+                        len(new_parts), os.pathsep.join(new_parts))
 
-    if not extra_dirs:
+    # ── fontconfig ──
+    # Without this Chromium LAUNCHES but resolves zero fonts and draws every
+    # glyph as nothing, so a fetch returns a blank-but-styled page. That reads
+    # as "the site didn't load" rather than as an error, which is strictly
+    # harder to diagnose than a crash. Measured 2026-07-29: this host has no
+    # /etc/fonts and the pool had no fontconfig handling at all -> canvas
+    # measureText('tofu') == 0.
+    if os.path.isdir('/etc/fonts') or os.environ.get('FONTCONFIG_FILE'):
         return
+    for prefix in _fallback_prefix_candidates():
+        conf_dir = os.path.join(prefix, 'etc', 'fonts')
+        conf_file = os.path.join(conf_dir, 'fonts.conf')
+        if os.path.isfile(conf_file):
+            os.environ['FONTCONFIG_PATH'] = conf_dir
+            os.environ['FONTCONFIG_FILE'] = conf_file
+            logger.info('[Playwright] FONTCONFIG_FILE=%s', conf_file)
+            return
 
-    current = os.environ.get('LD_LIBRARY_PATH', '')
-    current_parts = [p for p in current.split(':') if p]
-    # Prepend only the dirs that aren't already in the path (preserves caller intent)
-    new_parts = [d for d in extra_dirs if d not in current_parts]
-    if not new_parts:
+
+def _ensure_chromium_library_path():
+    """Make headless Chromium launchable AND legible before the first launch.
+
+    Chromium is a child subprocess, so it inherits ``os.environ``; both the
+    GUI-lib path and the fontconfig config must be set BEFORE the driver
+    starts or the launch either dies or renders nothing.
+
+    Resolution is DELEGATED to the Tofu host's ``chromium_env`` module when it
+    is importable — that module is the single source of truth for both halves
+    and is exercised by the host's guard suites. tofu_search is an independent
+    package, so it degrades to :func:`_fallback_ensure_chromium_env` (same
+    rule, no host dependency) rather than requiring it.
+
+    History (why the delegation, not another local copy): this function used to
+    key off ``$CONDA_PREFIX`` alone. That variable is set only by ``conda
+    activate`` — measured EMPTY on the dev host — so the self-heal was a silent
+    no-op and every browser fetch died with ``TargetClosedError`` from a bare
+    shell. It was one of four hand-copied divergent copies of this logic; the
+    other three were consolidated 2026-07-28/29 and this one was the last.
+    """
+    try:
+        from chromium_env import ensure_chromium_env
+    except Exception as e:
+        logger.debug('[Playwright] host chromium_env unavailable, using '
+                     'built-in fallback: %s', e)
+        _fallback_ensure_chromium_env()
         return
-    combined = ':'.join(new_parts + current_parts)
-    os.environ['LD_LIBRARY_PATH'] = combined
-    logger.info(
-        '[Playwright] Augmented LD_LIBRARY_PATH with %d conda lib dir(s): %s',
-        len(new_parts), ':'.join(new_parts),
-    )
+    report = ensure_chromium_env()
+    if report.get('lib_dirs_added') or report.get('fontconfig'):
+        logger.info('[Playwright] chromium env via host resolver: libs=%s fontconfig=%s',
+                    report.get('lib_dirs_added'), report.get('fontconfig'))
 
 
 class PlaywrightPool:
