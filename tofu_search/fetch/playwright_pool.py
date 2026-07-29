@@ -414,14 +414,64 @@ class PlaywrightPool:
 
             t0 = time.time()
             page.goto(url, timeout=timeout * 1000, wait_until='domcontentloaded')
+
+            # ── Render wait for an AUTHENTICATED load ──
+            # "innerText > 200 chars" is NOT a usable readiness signal here: an
+            # SSO login wall is itself a full page (~1.9k chars), so the
+            # condition is satisfied INSTANTLY and we return the wall while the
+            # session redirect is still in flight — the whole point of replaying
+            # cookies is then lost. Readiness for an authenticated fetch means
+            # "we are no longer on an auth host AND the text has stopped
+            # growing", so wait for both.
             _max_render_wait = min(timeout, 12)
+            _AUTH_HOST_HINT = ('/sson/login', '/login?', 'ssosv.', 'passport.',
+                               'account.', '/oauth', '/sso/')
+
+            def _on_auth_wall():
+                u = (page.url or '').lower()
+                return any(h in u for h in _AUTH_HOST_HINT)
+
+            # 1) If we landed on a login wall, the cookies may still be being
+            #    exchanged for a session — give the redirect a chance to leave.
+            if _on_auth_wall():
+                _wall_deadline = time.time() + _max_render_wait
+                while time.time() < _wall_deadline and _on_auth_wall():
+                    page.wait_for_timeout(500)
+                if _on_auth_wall():
+                    logger.info('[Pool:auth] still on an auth wall after %.1fs — '
+                                'stored session likely expired/insufficient: %s',
+                                time.time() - t0, page.url[:100])
+                else:
+                    logger.debug('[Pool:auth] left the auth wall in %.1fs — now %s',
+                                 time.time() - t0, page.url[:90])
+
             try:
                 page.wait_for_function(
                     'document.body && document.body.innerText.trim().length > 200',
-                    timeout=_max_render_wait * 1000,
+                    timeout=max(int((_max_render_wait - (time.time() - t0)) * 1000), 1000),
                 )
             except Exception as e:
                 logger.debug('[Pool:auth] render wait timed out for %s: %s', url[:80], e)
+
+            # 2) Text-stability settle — the SPA mounts its real content after
+            #    the auth check resolves, so the first non-empty body is usually
+            #    a shell. Two consecutive equal lengths = done.
+            _prev_len, _stable = 0, 0
+            for _ in range(8):
+                if time.time() - t0 > timeout:
+                    break
+                try:
+                    _cur = page.evaluate('document.body.innerText.trim().length')
+                except Exception:
+                    break
+                if _cur == _prev_len and _cur > 0:
+                    _stable += 1
+                    if _stable >= 2:
+                        break
+                else:
+                    _stable = 0
+                _prev_len = _cur
+                page.wait_for_timeout(500)
             elapsed = time.time() - t0
 
             _remaining_ms = max(int((timeout - elapsed) * 1000), 3000)
