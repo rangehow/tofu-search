@@ -260,8 +260,16 @@ def filter_web_content(raw_text: str, *, url: str = '', query: str = '',
         elapsed = time.time() - t0
 
         _stripped = (content or '').strip()
-        if (not _stripped
-                or _stripped == _IRRELEVANT_STOP
+        if not _stripped:
+            # An empty completion is an ANOMALY (rate-limited empty, content-
+            # policy refusal, gateway truncation), NOT a relevance verdict —
+            # fail open like the exception path: serve the raw text and do NOT
+            # cache, so a transient hiccup neither drops a good page from the
+            # results nor poisons the cache for the TTL.
+            logger.warning('[ContentFilter] EMPTY response (anomaly, serving raw) mode=%s url=%s %.1fs',
+                           mode, url[:100], elapsed)
+            return raw_text
+        if (_stripped == _IRRELEVANT_STOP
                 or _stripped.startswith(IRRELEVANT_SENTINEL)
                 or _stripped.startswith(_IRRELEVANT_STOP)):
             logger.info('[ContentFilter] IRRELEVANT mode=%s url=%s query=%r %.1fs',

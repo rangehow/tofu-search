@@ -163,6 +163,27 @@ def test_llm_error_returns_raw_text():
     assert out == raw                            # filtering never blocks the page
 
 
+# ── Empty-response anomaly (fail-open, never cached) ──
+
+def test_empty_response_fails_open_and_is_not_cached():
+    calls = []
+    raw = 'e' * 5000
+    cfg = _cfg(_fake_llm(calls, '   '))            # whitespace-only completion
+    kwargs = dict(url='https://example.com/empty', query='q', config=cfg)
+    assert filter_web_content(raw, **kwargs) == raw   # fail-open, NOT sentinel
+    assert filter_web_content(raw, **kwargs) == raw
+    assert len(calls) == 2                            # anomaly was NOT cached
+
+
+def test_empty_string_response_fails_open():
+    calls = []
+    raw = 'n' * 5000
+    cfg = _cfg(_fake_llm(calls, ''))               # empty completion
+    out = filter_web_content(raw, url='https://example.com/emptystr', query='q', config=cfg)
+    assert out == raw
+
+
+# ── Result cache ──
 # ── Result cache ──
 
 def test_cache_hit_skips_second_llm_call():

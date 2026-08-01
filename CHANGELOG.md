@@ -21,6 +21,15 @@
   `_FetchCache` pattern as the fetch cache. A repeated search of the same
   pages costs zero LLM calls. Failures are never cached.
 
+### Fixed
+- **Empty LLM responses no longer drop pages or poison the filter cache.**
+  An empty/whitespace completion was treated as an irrelevance verdict: the
+  page vanished from results AND the bogus verdict was cached for the TTL.
+  An empty completion is an anomaly (rate-limited empty, content-policy
+  refusal, gateway truncation), not a verdict — it now fails open (raw text
+  served, nothing cached), consistent with the exception path. Explicit
+  irrelevance verdicts are unchanged (sentinel + cached).
+
 ### Changed
 - **`filter_timeout` default 300 → 45s.** The old ceiling let a single
   wedged LLM call stall step 5 for five minutes. On timeout/error the raw
