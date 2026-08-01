@@ -130,6 +130,29 @@ class SearchConfig:
     # metadata verticals use — but still well inside search_deadline_secs.
     vertical_travel_timeout: int = 25
 
+    # ── Xiaohongshu engine account-risk guard ──
+    # XHS polices automated access at the ACCOUNT level (限流/滑块/封号), and
+    # this engine fires on every web search while connected — so the engine
+    # paces itself instead of letting chat frequency set the request rate.
+    # xhs_min_interval_s: minimum seconds between two real XHS page loads,
+    #   plus a small random jitter (限 QPS + 随机延迟, the cross-project
+    #   consensus for account safety). When the required wait would exceed
+    #   the engine's latency budget the call is SKIPPED (returns []) rather
+    #   than stalling the whole pipeline. Env: TOFU_XHS_MIN_INTERVAL_S.
+    #   0 disables pacing.
+    xhs_min_interval_s: float = 5.0
+    # xhs_cache_ttl_s: same-keyword results are served from an in-memory TTL
+    #   cache — a chat assistant re-asks near-identical queries constantly,
+    #   and each repeat would be another logged-in hit (同关键词缓存, also
+    #   consensus). Env: TOFU_XHS_CACHE_TTL_S. 0 disables the cache.
+    xhs_cache_ttl_s: int = 600
+    # xhs_backoff_cooldown_s: after several CONSECUTIVE empty scrapes (the
+    #   signature of a risk-control wall or an expired cookie — a captcha /
+    #   login-redirect page carries no note cards), the engine stops touching
+    #   XHS for this long. Hammering a flagged account makes the flag worse.
+    #   Env: TOFU_XHS_BACKOFF_COOLDOWN_S.
+    xhs_backoff_cooldown_s: int = 1800
+
     # ── LLM configuration for content filter ──
     # Option A: OpenAI-compatible endpoint
     llm_api_key: str = ''
@@ -143,8 +166,29 @@ class SearchConfig:
 
     # ── Content filter settings ──
     filter_enabled: bool = True
+    # 'gate'    — relevance verdict ONLY: the LLM reads the head of the page
+    #             (capped at gate_input_max_chars) and answers [USEFUL] /
+    #             §§IRRELEVANT§§ — a handful of output tokens. Useful pages keep
+    #             their ORIGINAL extracted text. Fast (~1-3s/page).
+    # 'rewrite' — the LLM regenerates the whole cleaned page verbatim (the
+    #             pre-0.6 behaviour): highest cleaning quality, but output ≈
+    #             page length, so generation dominates at 10-60s+ per page.
+    filter_mode: str = 'gate'
     filter_min_chars: int = 3000
-    filter_timeout: int = 300
+    # Per-LLM-call ceiling. 45s is generous for gate mode; in rewrite mode a
+    # very long page may exceed it, in which case the raw text is served
+    # (filtering is an enhancement, never a blocker). Raise it if you run
+    # rewrite mode against big pages. Was 300 before 0.6.
+    filter_timeout: int = 45
+    # Gate mode judges relevance from the head of the page — the full body is
+    # never sent to the LLM, which kills the prompt-processing cost too.
+    # Rewrite mode always sends the full text.
+    gate_input_max_chars: int = 12_000
+    # Result cache for the LLM filter, keyed on (mode, url, query,
+    # user_question, raw_text) — a repeated search of the same pages costs
+    # zero LLM calls. 0 disables. Mirrors the fetch cache's TTL+LRU pattern.
+    filter_cache_ttl: int = 600
+    filter_cache_max_size: int = 500
 
     # ── Pre-fetch relevance gate ──
     # A cheap, no-LLM lexical check (title+snippet vs query terms) that runs
@@ -213,6 +257,9 @@ def configure(**kwargs) -> SearchConfig:
             'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
             'TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS': ('min_request_interval_ms', int),
             'ROLLINGGO_API_KEY': ('rollinggo_api_key', str),
+            'TOFU_XHS_MIN_INTERVAL_S': ('xhs_min_interval_s', float),
+            'TOFU_XHS_CACHE_TTL_S': ('xhs_cache_ttl_s', int),
+            'TOFU_XHS_BACKOFF_COOLDOWN_S': ('xhs_backoff_cooldown_s', int),
         }
 
         # Apply env var defaults (only for fields not explicitly set by user)
