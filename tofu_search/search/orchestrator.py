@@ -433,9 +433,13 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         if to_filter:
             logger.info('[Search] LLM-filtering %d/%d fetched pages, query=%r user_question=%r',
                         len(to_filter), len(unique_results), query[:80], user_question[:80])
+            # min_chars deliberately NOT overridden: config.filter_min_chars
+            # (default 3000) lets short pages skip the LLM entirely. The old
+            # zero-min_chars override here forced EVERY page through the
+            # filter and was a major step-5 latency source.
             filtered = filter_web_contents_batch(to_filter, query=query,
                                                  user_question=user_question,
-                                                 min_chars=0, config=config)
+                                                 config=config)
             for r in unique_results:
                 if r['url'] in filtered:
                     val = filtered[r['url']]

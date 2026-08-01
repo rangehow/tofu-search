@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+- **`filter_mode` — the LLM content filter gains a verdict-only `gate` mode
+  (new default).** The pre-0.6 filter asked the model to REGENERATE the whole
+  cleaned page (`rewrite`): output tokens ≈ page length, so generation time
+  dominated at 10-60s+ per page and a 6-page search step-5 routinely took
+  30-120s — users reported the filter made search "practically unusable".
+  `gate` mode asks only for the relevance verdict (`[USEFUL]` /
+  `§§IRRELEVANT§§`, a handful of output tokens) on the CAPPED head of the
+  page (new `gate_input_max_chars`, default 12,000), and useful pages keep
+  their ORIGINAL extracted text — boilerplate removal stays with the
+  (already applied) HTML extractor. `filter_mode='rewrite'` preserves the
+  old behaviour for maximum cleaning quality. An unknown mode logs a
+  warning and falls back to `gate`.
+- **Result cache for the LLM filter** (`filter_cache_ttl` 600s /
+  `filter_cache_max_size` 500, 0 disables), keyed on
+  (mode, url, query, user_question, raw_text) via the same TTL+LRU
+  `_FetchCache` pattern as the fetch cache. A repeated search of the same
+  pages costs zero LLM calls. Failures are never cached.
+
+### Changed
+- **`filter_timeout` default 300 → 45s.** The old ceiling let a single
+  wedged LLM call stall step 5 for five minutes. On timeout/error the raw
+  text is served (filtering is an enhancement, never a blocker) — 45s is
+  generous for gate mode; raise it when running `rewrite` on big pages.
+- **The orchestrator no longer forces `min_chars=0`.** Step 5 passed the
+  override explicitly, silently disabling the `filter_min_chars=3000`
+  short-circuit so EVERY page — however short — paid an LLM call. Short
+  pages skip the filter again.
+
+### Measured
+- `examples/bench_content_filter.py` (fake LLM, documented latency model:
+  20k chars/s prompt, 600 chars/s generation, 6 pages = 4×60k + 10k + 1.5k
+  chars): BEFORE (rewrite + min_chars=0 + no cache) step5 ≈ **96.7s
+  simulated, 6 LLM calls** → AFTER (0.6.0 defaults) ≈ **0.82s, 5 calls**
+  (117×) → warm cache ≈ **0.08s, 0 calls** (1288×).
+- Tests: `tests/test_content_filter_modes.py` (15) — gate verdict paths
+  (useful/irrelevant/both sentinel forms), input capping, prompt
+  separation, unknown-mode fallback, min_chars short-circuit (unit, batch,
+  and an orchestrator source pin), rewrite parity, error fallback, cache
+  hit / irrelevant caching / mode in the key / ttl=0 disable.
+
 ## 0.5.3
 # Changelog
 
