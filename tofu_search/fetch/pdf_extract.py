@@ -27,6 +27,44 @@ except ImportError:
     pymupdf4llm = None
     HAS_PYMUPDF4LLM = False
 
+_pymupdf_rag = None
+_pymupdf_rag_tried = False
+
+
+def _to_markdown_classic(md_doc, **kw):
+    """``pymupdf4llm.to_markdown`` pinned to the classic rag implementation.
+
+    pymupdf4llm ≥1.26 routes the top-level call through its NEW layout/OCR
+    pipeline whenever the optional ``pymupdf.layout`` package is importable
+    (import-time ``use_layout(True)``). That pipeline's OCR adapters call
+    ``RapidOCR.text_detector`` — an attribute that only existed on
+    rapidocr-onnxruntime ≤1.2; modern versions (1.3.x AND 1.4.x) name it
+    ``text_det``. Every page whose layout analysis votes needs_ocr (bad
+    chars / structured scan-like images) therefore crashes with
+    ``'RapidOCR' object has no attribute 'text_detector'`` and the WHOLE
+    document degrades to the raw fallback — measured ×21/day in production
+    (2026-08-01) and reproduced on arXiv 1706.03762 (top-level call →
+    crash at rapidtess_api.py:189 → 39.5k chars raw; classic seam →
+    ~40.6k chars rich markdown). Upstream 1.28.0 keeps the same broken
+    call behind a louder RuntimeError, so upgrading is NOT a fix. The
+    classic implementation — the one honoring ``page_chunks`` /
+    ``table_strategy`` / ``show_progress`` — lives on at
+    ``pymupdf4llm.helpers.pymupdf_rag``. Same seam chatui's
+    lib/pdf_parser/text.py has used in production.
+    """
+    global _pymupdf_rag, _pymupdf_rag_tried
+    if not _pymupdf_rag_tried:
+        _pymupdf_rag_tried = True
+        try:
+            from pymupdf4llm.helpers import pymupdf_rag as _rag
+            _pymupdf_rag = _rag
+        except Exception as e:
+            logger.debug('pymupdf_rag direct import unavailable, '
+                         'falling back to top-level to_markdown: %s', e)
+    if _pymupdf_rag is not None:
+        return _pymupdf_rag.to_markdown(md_doc, **kw)
+    return pymupdf4llm.to_markdown(md_doc, **kw)
+
 
 def _strip_manuscript_line_numbers(text):
     """Remove line numbers commonly found in review/manuscript PDFs."""
@@ -87,7 +125,7 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = 0, url: str = '') -> str
             md_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             try:
                 n = len(md_doc)
-                chunks = pymupdf4llm.to_markdown(
+                chunks = _to_markdown_classic(
                     md_doc, page_chunks=True, show_progress=False,
                     table_strategy="lines",
                 )

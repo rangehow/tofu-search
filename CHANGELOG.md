@@ -1,6 +1,37 @@
 # Changelog
 
 ## 0.5.3
+# Changelog
+
+## 0.5.4
+
+### Fixed
+- **PDF extraction no longer degrades on OCR-triggering pages.** `pdf_extract`
+  called the top-level `pymupdf4llm.to_markdown`, which (pymupdf4llm ≥1.26,
+  with `pymupdf.layout` importable) routes through the NEW layout/OCR
+  pipeline. That pipeline's OCR adapters call `RapidOCR.text_detector` — an
+  attribute that only existed on rapidocr-onnxruntime ≤1.2; modern 1.3.x and
+  1.4.x both name it `text_det`. Every page whose layout analysis votes
+  needs_ocr (bad glyphs, or scan-like images with high variance/edge energy)
+  crashed with `'RapidOCR' object has no attribute 'text_detector'` and the
+  WHOLE document fell back to raw `get_text` — measured ×21/day in
+  production, reproduced on arXiv 1706.03762 (crash → 39,512 raw chars).
+  Upstream 1.28.0 keeps the same broken call behind a louder RuntimeError,
+  so upgrading is not a fix. The extractor now calls the classic
+  implementation at `pymupdf4llm.helpers.pymupdf_rag.to_markdown` directly —
+  the seam that honors `page_chunks` / `table_strategy` / `show_progress`
+  and never touches the OCR pipeline (same seam the host project's own PDF
+  parser uses). Measured after the fix on the same PDF: 40,608 chars of rich
+  markdown with 35 table rows.
+- Tests: `tests/test_pdf_extract_classic_seam.py` (3) — a hermetic
+  needs_ocr trigger PDF (synthetic noise image matching analyze_page's
+  variance/edge signature) must keep rich markdown with no raw-fallback
+  warning; the extract path must ride the rag seam with the kwargs intact
+  (top-level call is a test-failing regression); a source pin guards the
+  wiring. NEUTER-verified: reverting the call site to top-level turns the
+  two behavioural tests red.
+
+## 0.5.3
 
 ### Added
 - **`allow_private_hosts` — an explicit, HOSTNAME-anchored SSRF exemption.**
