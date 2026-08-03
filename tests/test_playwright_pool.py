@@ -182,3 +182,65 @@ def test_worker_loop_success_sets_ready(fake_playwright_module):
     assert pool._ready is True
     assert pool._ready_event.is_set()
     assert created["pw"].stopped is True   # clean shutdown stops driver too
+
+
+# ── register_task_kind (0.6.1) — host apps ride the pool ──
+
+def test_register_task_kind_rejects_builtin_and_conflicting_handlers():
+    pool = PlaywrightPool()
+    with pytest.raises(ValueError):
+        pool.register_task_kind('pdf_render', lambda b, p: None)
+    with pytest.raises(ValueError):
+        pool.register_task_kind('', lambda b, p: None)
+    with pytest.raises(ValueError):
+        pool.register_task_kind('page_x', 'not-callable')
+
+    handler = lambda b, p: {'ok': True}  # noqa: E731
+    pool.register_task_kind('page_x', handler)
+    pool.register_task_kind('page_x', handler)  # same handler → idempotent
+    with pytest.raises(ValueError):
+        pool.register_task_kind('page_x', lambda b, p: {'ok': False})
+
+
+def test_worker_loop_dispatches_registered_kind(fake_playwright_module):
+    make, created = fake_playwright_module
+    make(fail_launch=False)
+
+    pool = PlaywrightPool()
+    seen = {}
+
+    def _handler(browser, payload):
+        seen['browser'] = browser
+        seen['payload'] = payload
+        return {'echo': payload}
+
+    pool.register_task_kind('page_preview', _handler)
+
+    import queue as q
+    task_q = q.Queue()
+    result_q = q.Queue()
+    task_q.put((('page_preview', {'w': 1280}), result_q))
+    task_q.put(None)  # sentinel
+
+    pool._worker_loop(task_q)
+
+    assert result_q.get_nowait() == {'echo': {'w': 1280}}
+    assert isinstance(seen['browser'], FakeBrowser)
+    assert seen['payload'] == {'w': 1280}
+
+
+def test_worker_loop_unknown_kind_still_returns_none(fake_playwright_module):
+    """The pre-registry behaviour must survive: unknown kinds warn + None."""
+    make, created = fake_playwright_module
+    make(fail_launch=False)
+
+    pool = PlaywrightPool()
+    import queue as q
+    task_q = q.Queue()
+    result_q = q.Queue()
+    task_q.put((('nope', {}), result_q))
+    task_q.put(None)
+
+    pool._worker_loop(task_q)
+
+    assert result_q.get_nowait() is None

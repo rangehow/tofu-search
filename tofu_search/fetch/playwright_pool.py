@@ -171,6 +171,11 @@ class PlaywrightPool:
         self._started = False
         self._last_fail_ts = 0     # 上次启动失败时间戳 (防止无限重启)
         self._missing_binary = False  # last launch failed because chromium not installed
+        # Extra task kinds registered by the HOST app (see register_task_kind).
+        # The worker loop consults this AFTER the built-in kinds, so tofu_search
+        # ships zero host-feature code while the host can still ride this pool
+        # instead of spawning a second Chromium.
+        self._kind_handlers = {}
 
     # ── 专用线程的主循环 ──
     def _worker_loop(self, task_q):
@@ -266,6 +271,8 @@ class PlaywrightPool:
                         result = self._do_fetch_authenticated(browser, kpayload)
                     elif kind == 'auth_search':
                         result = self._do_search_authenticated(browser, kpayload)
+                    elif kind in self._kind_handlers:
+                        result = self._kind_handlers[kind](browser, kpayload)
                     else:
                         logger.warning(
                             '[Pool] unknown task kind=%r — returning None', kind,
@@ -665,6 +672,33 @@ class PlaywrightPool:
                     context.close()
                 except Exception as e:
                     logger.debug('[Fetch] Playwright context.close() failed for %s: %s', url[:80], e, exc_info=True)
+
+    #: Kinds the pool itself implements; register_task_kind refuses these.
+    _BUILTIN_KINDS = frozenset({'pdf_render', 'auth_fetch', 'auth_search'})
+
+    def register_task_kind(self, kind, handler):
+        """Register an extra task kind dispatched on the pool worker thread.
+
+        ``handler`` is called as ``handler(browser, payload) -> result`` ON the
+        dedicated Playwright thread, so it may use the sync Playwright API
+        directly. Registration is process-global and idempotent ONLY for the
+        same handler object: re-registering a kind with a DIFFERENT handler
+        raises ValueError (a silent swap would mask a double-registration
+        bug), and built-in kinds can never be overridden.
+        """
+        if not kind or not isinstance(kind, str):
+            raise ValueError(f'kind must be a non-empty str, got {kind!r}')
+        if not callable(handler):
+            raise ValueError(f'handler for kind={kind!r} must be callable')
+        if kind in self._BUILTIN_KINDS:
+            raise ValueError(
+                f'kind={kind!r} is a built-in pool kind and cannot be overridden')
+        with self._lock:
+            existing = self._kind_handlers.get(kind)
+            if existing is not None and existing is not handler:
+                raise ValueError(
+                    f'kind={kind!r} already registered with a different handler')
+            self._kind_handlers[kind] = handler
 
     def _ensure_thread(self):
         """确保专用 Playwright 线程已启动。"""
