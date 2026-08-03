@@ -75,6 +75,33 @@ if [ "$WANT_PLAYWRIGHT" -eq 1 ]; then
         echo "WARNING: libatk still missing — Chromium will not launch." >&2
         echo "         Fix with root: sudo python3 -m playwright install-deps chromium" >&2
       fi
+
+      # FUSE-mounted env? Installed is not enough — a FUSE bad window kills
+      # Chromium's .so reads at LAUNCH time (measured 2026-08-03 on
+      # beegfs-fuse: 'libatk cannot open' storms alternating with successful
+      # launches under a CONSTANT process env). The deterministic answer is a
+      # local-disk copy + CHROMIUM_EXTRA_LIB_DIRS (the pool's fallback reads
+      # it first, unfiltered).
+      if df -T "$_py_prefix" 2>/dev/null | awk 'NR==2{print $2}' | grep -qi fuse; then
+        _browser_libs="${TOFU_BROWSER_LIBS_DIR:-$HOME/tofu-browser-libs}"
+        echo "==> Env prefix is on FUSE — installing a local-disk Chromium-libs copy at $_browser_libs"
+        if [ -d "$_browser_libs/conda-meta" ]; then
+          _local_cmd=(conda install -p "$_browser_libs" -c conda-forge --override-channels -y)
+        else
+          _local_cmd=(conda create -p "$_browser_libs" -c conda-forge --override-channels -y)
+        fi
+        if ! "${_local_cmd[@]}" "${_libs[@]}"; then
+          for _pkg in "${_libs[@]}"; do
+            "${_local_cmd[@]}" "$_pkg" || echo "WARNING: local chromium lib '$_pkg' unavailable on this channel" >&2
+          done
+        fi
+        if [ -f "$_browser_libs/lib/libatk-1.0.so.0" ]; then
+          echo "==> Local-disk Chromium libs ready."
+          echo "    export CHROMIUM_EXTRA_LIB_DIRS=$_browser_libs/lib"
+        else
+          echo "WARNING: local-disk copy incomplete — launches will stay FUSE-dependent" >&2
+        fi
+      fi
     else
       echo "==> Not a conda env ($_py_prefix) — skipping rootless shared-lib install"
       echo "    If Chromium fails to launch: sudo python3 -m playwright install-deps chromium"
