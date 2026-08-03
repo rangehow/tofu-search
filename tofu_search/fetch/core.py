@@ -211,6 +211,15 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             # here reported the replay as a success and made the browser
             # escalation UNREACHABLE. Judge the CONTENT.
             nonlocal _auth_wall
+            if not (_auth_src.get('cookies') or []):
+                # A browser_first row matches with ZERO stored cookies (the
+                # live browser session IS the credential). Replaying nothing
+                # would load the login wall in a headless pool — pure waste
+                # and bot-shaped traffic.
+                logger.debug('[Fetch] auth-source row has no stored cookies '
+                             '— replay has nothing to send, skipping — %s',
+                             url[:80])
+                return None
             text = _try_authenticated_fetch(url, _auth_src, max_chars, timeout)
             if text and _looks_like_login_wall(text):
                 logger.info('[Fetch] auth-source replay returned a LOGIN WALL '

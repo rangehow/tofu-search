@@ -191,6 +191,19 @@ def test_fetch_browser_first_order(rig, fetch_rig):
     assert fetch_rig.order[0][1] == 'auth_source_browser_first'
 
 
+def test_replay_never_fires_without_cookies(rig, fetch_rig):
+    """A browser_first row matches with ZERO stored cookies (the live session
+    is the credential). When the browser is unavailable, the replay leg must
+    NO-OP — an anonymous pool load of a login wall is waste + bot traffic."""
+    row = _source(None)
+    row['cookies'] = []
+    tofu_search.register_auth_source_provider(_Auth(row))
+    fetch_rig.browser_result = None          # browser unavailable
+    fetch_core.fetch_page_content('https://www.xiaohongshu.com/explore/abc')
+    assert [leg for leg, _ in fetch_rig.order] == ['browser'], (
+        'no stored cookies = nothing to replay; the replay leg must not fire')
+
+
 def test_fetch_public_skips_identity(rig, fetch_rig):
     tofu_search.register_auth_source_provider(_Auth(_source('public')))
     fetch_core.fetch_page_content('https://www.xiaohongshu.com/explore/abc')
