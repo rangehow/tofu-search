@@ -46,7 +46,12 @@ from urllib.parse import quote
 
 from tofu_search.config import get_config
 from tofu_search.log import get_logger
-from tofu_search.providers import get_auth_source_provider, get_browser_provider
+from tofu_search.providers import (
+    _emit_site_drift,
+    get_auth_source_provider,
+    get_browser_provider,
+    get_site_knowledge_provider,
+)
 from tofu_search.search._common import clean_text
 
 logger = get_logger(__name__)
@@ -66,7 +71,7 @@ _MAX_THROTTLE_WAIT_S = 6.0
 # Same-keyword cache ceiling (FIFO eviction; entries are tiny).
 _CACHE_MAX_ENTRIES = 64
 
-_EXTRACTOR_JS = r"""
+_CARD_EXTRACT_JS = r"""
 (() => {
   const out = [];
   const seen = new Set();
@@ -106,6 +111,62 @@ _EXTRACTOR_JS = r"""
   return out;
 })()
 """
+
+# The POOL path contract is a bare list (``_do_search_authenticated`` coerces
+# anything else to []), so the pool keeps the legacy list form. The BROWSER
+# path wraps the same card body with a PROBE: the dict result tells drift
+# apart from a real empty — anchors>0 while items==0 means the page rendered
+# note links but our selectors could not make cards of them.
+_EXTRACTOR_JS = _CARD_EXTRACT_JS
+
+
+def _probed_extractor(list_extractor_js: str) -> str:
+    """Wrap a LIST-form extractor with the drift probe (dict result)."""
+    return (
+        '(() => { const items = ' + list_extractor_js + ';'
+        ' const anchors = document.querySelectorAll('
+        '  \'a[href*="/explore/"], a[href*="/search_result/"]\').length;'
+        ' return {items: (Array.isArray(items) ? items : []),'
+        '  probe: {anchors: anchors, title: document.title || \'\','
+        '          url: location.href}}; })()'
+    )
+
+
+def _split_extraction(raw):
+    """Normalize an extraction result to ``(items, probe)``.
+
+    ``(list, None)`` for the legacy list form; ``(items, probe)`` for the
+    probed dict form; ``([], None)`` for anything else. A [] from EITHER
+    form is a REAL empty unless the probe says the page had anchors.
+    """
+    if isinstance(raw, list):
+        return raw, None
+    if isinstance(raw, dict):
+        items = raw.get('items')
+        probe = raw.get('probe') if isinstance(raw.get('probe'), dict) else None
+        return (items if isinstance(items, list) else []), probe
+    return [], None
+
+
+def _knowledge() -> dict | None:
+    """Host-pinned extraction knowledge for XHS, or None (use built-ins).
+
+    This is the re-pin seam: when selectors drift, the host's site-doctor
+    verifies new ones against the LIVE page and stores them as DATA; the
+    engine picks them up here without a library release.
+    """
+    provider = get_site_knowledge_provider()
+    if provider is None:
+        return None
+    try:
+        k = provider.get_knowledge(_DOMAIN)
+    except Exception as e:
+        logger.debug('[Search] XHS: site-knowledge lookup failed: %s', e)
+        return None
+    if isinstance(k, dict) and isinstance(k.get('extractor_js'), str) \
+            and k['extractor_js'].strip():
+        return k
+    return None
 
 
 class _RiskGuard:
@@ -228,13 +289,29 @@ def _search_via_browser(url: str):
 
     The page's own JS signs every request and the IP/fingerprint match the
     site's trust decisions — nothing is exported or replayed, which is exactly
-    what the server-side pool cannot offer. Returns the extractor's list
-    (possibly empty = REAL empty), or None when the browser path failed.
+    what the server-side pool cannot offer. Returns ``(items, probe)`` —
+    ``items`` possibly empty (REAL empty unless the probe counted anchors),
+    or None when the browser path failed. Selectors come from the host's
+    site-knowledge store when pinned (drift re-pin), else the built-ins.
     """
     provider = get_browser_provider()
+    k = _knowledge()
+    wait_selector = (k or {}).get('wait_selector') or _WAIT_SELECTOR
+    list_extractor = (k or {}).get('extractor_js') or _CARD_EXTRACT_JS
     try:
-        return provider.scrape(url, wait_selector=_WAIT_SELECTOR,
-                               extractor_js=_EXTRACTOR_JS, timeout=20, scrolls=2)
+        scrolls = int((k or {}).get('scrolls') or 2)
+    except (TypeError, ValueError):
+        scrolls = 2
+    try:
+        raw = provider.scrape(url, wait_selector=wait_selector,
+                              extractor_js=_probed_extractor(list_extractor),
+                              timeout=20, scrolls=scrolls)
+        if raw is None:
+            # Path UNAVAILABLE — propagate None so the pool fallback fires.
+            # (Normalizing None to ([], None) would read as a REAL empty and
+            # skip the fallback, inverting the None-vs-[] contract.)
+            return None
+        return _split_extraction(raw)
     except Exception as e:
         logger.warning('[Search] XHS: browser scrape failed, will fall back '
                        'to the pool: %s', e)
@@ -293,10 +370,30 @@ def search_xhs(query, max_results=10, freshness=''):
     # only runs when the browser path is unavailable (None), never when it
     # merely returned zero cards ([] = real empty, feeds the backoff below).
     items = None
+    probe = None
     via = 'none'
     if browser_live:
-        items = _search_via_browser(url)
-        via = 'browser' if items is not None else 'none'
+        got = _search_via_browser(url)
+        if got is not None:
+            items, probe = got
+            via = 'browser'
+    # Selector-drift signal: the page rendered note anchors (probe saw them)
+    # yet extraction made ZERO cards — the selectors, not the query, are at
+    # fault. Distinct from a real empty (anchors==0) and from a risk wall
+    # (a wall renders no note anchors at all). Emitted BEFORE the pool
+    # fallback because the pool runs the SAME selectors and drifts alike.
+    if via == 'browser' and not items and probe \
+            and int(probe.get('anchors') or 0) > 0:
+        logger.warning(
+            '[Search] XHS: SELECTOR DRIFT suspected — page rendered %d note '
+            'anchors but extraction made 0 cards (page title %.60r). The '
+            'site DOM changed; re-pinning knowledge is the fix, not retry.',
+            int(probe.get('anchors') or 0), probe.get('title') or '')
+        _emit_site_drift(_DOMAIN, url, {
+            'anchors': int(probe.get('anchors') or 0),
+            'page_title': probe.get('title') or '',
+            'knowledge': 'pinned' if _knowledge() else 'builtin',
+        })
     if items is None and cookies:
         from tofu_search.fetch.playwright_pool import _pw_pool
         items = _pw_pool.search_authenticated(

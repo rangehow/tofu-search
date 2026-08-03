@@ -55,8 +55,12 @@ from tofu_search.fetch.utils import looks_like_text_asset
 from tofu_search.providers import (
     AuthSourceProvider,
     BrowserProvider,
+    SiteKnowledgeProvider,
+    clear_site_drift_listeners,
     register_auth_source_provider,
     register_browser_provider,
+    register_site_drift_listener,
+    register_site_knowledge_provider,
 )
 from tofu_search.search.format import format_search_for_tool_response as format_results
 from tofu_search.search.orchestrator import perform_web_search
@@ -105,8 +109,12 @@ __all__ = [
     # Provider seams (host integration)
     'BrowserProvider',
     'AuthSourceProvider',
+    'SiteKnowledgeProvider',
     'register_browser_provider',
     'register_auth_source_provider',
+    'register_site_knowledge_provider',
+    'register_site_drift_listener',
+    'clear_site_drift_listeners',
     # Site-reader tier (public-endpoint handlers, e.g. x.com syndication)
     'SiteReader',
     'register_reader',

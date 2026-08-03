@@ -11,6 +11,14 @@ were previously chatui-only:
   * **Auth-source provider** — supply stored cookies/proxy for login-walled
     domains (e.g. Xiaohongshu) so the Playwright pool can replay a logged-in
     session.
+  * **Site-knowledge provider** — supply per-site extraction knowledge
+    (wait selector / extractor JS / scroll count) as DATA, so a host can
+    re-pin a site's selectors without shipping a library release. Engines
+    fall back to their built-in constants when the provider has no entry.
+  * **Site-drift listeners** — the library EMITS a signal when a page
+    clearly rendered note-like content but the configured selectors
+    extracted nothing (i.e. the selectors drifted, not a real empty
+    result). A host listens and triggers its own re-con workflow.
 
 Design mirrors the trading-plugin ``tofu.providers`` seam: dependency points
 INWARD (host → library); the library never imports the host. Every hook is
@@ -30,10 +38,15 @@ logger = get_logger(__name__)
 __all__ = [
     'BrowserProvider',
     'AuthSourceProvider',
+    'SiteKnowledgeProvider',
     'register_browser_provider',
     'register_auth_source_provider',
+    'register_site_knowledge_provider',
     'get_browser_provider',
     'get_auth_source_provider',
+    'get_site_knowledge_provider',
+    'register_site_drift_listener',
+    'clear_site_drift_listeners',
 ]
 
 
@@ -120,9 +133,27 @@ class AuthSourceProvider:
         return None
 
 
+class SiteKnowledgeProvider:
+    """Interface for host-supplied per-site extraction knowledge.
+
+    A "knowledge" entry is a dict carrying at least ``extractor_js`` (the
+    in-page JS returning a list of result dicts), optionally
+    ``wait_selector`` / ``scrolls`` / ``version`` / ``verified_at``. Engines
+    consult the provider FIRST and fall back to their built-in constants
+    when it returns None — so the library ships sane defaults and the host
+    owns re-pins (e.g. after a selector-drift re-con).
+    """
+
+    def get_knowledge(self, domain: str) -> Optional[dict]:
+        """Return the knowledge entry for ``domain``, or None."""
+        return None
+
+
 _lock = threading.Lock()
 _browser_provider: Optional[BrowserProvider] = None
 _auth_source_provider: Optional[AuthSourceProvider] = None
+_site_knowledge_provider: Optional[SiteKnowledgeProvider] = None
+_drift_listeners: list = []
 
 
 def register_browser_provider(provider: Optional[BrowserProvider]) -> None:
@@ -153,3 +184,54 @@ def get_auth_source_provider() -> Optional[AuthSourceProvider]:
     """Return the registered auth-source provider, or None."""
     with _lock:
         return _auth_source_provider
+
+
+def register_site_knowledge_provider(
+        provider: Optional[SiteKnowledgeProvider]) -> None:
+    """Install (or clear, with ``None``) the global site-knowledge provider."""
+    global _site_knowledge_provider
+    with _lock:
+        _site_knowledge_provider = provider
+    logger.info('[Providers] site-knowledge provider %s',
+                'registered' if provider else 'cleared')
+
+
+def get_site_knowledge_provider() -> Optional[SiteKnowledgeProvider]:
+    """Return the registered site-knowledge provider, or None."""
+    with _lock:
+        return _site_knowledge_provider
+
+
+def register_site_drift_listener(cb) -> None:
+    """Subscribe ``cb(site, url, evidence)`` to selector-drift signals.
+
+    Fired by engines when a page demonstrably rendered the kind of content
+    the extractor targets (probe counted matching anchors) yet extraction
+    yielded ZERO items — the signature of SELECTOR DRIFT, not a real empty
+    result and not a risk-control wall (a wall renders no content anchors).
+    Listeners must be fast and non-blocking; the engine continues
+    immediately. A raising listener is logged and swallowed — it can never
+    break a search.
+    """
+    with _lock:
+        _drift_listeners.append(cb)
+    logger.info('[Providers] site-drift listener registered (%d total)',
+                len(_drift_listeners))
+
+
+def clear_site_drift_listeners() -> None:
+    """Drop all drift listeners (test hygiene)."""
+    with _lock:
+        _drift_listeners.clear()
+
+
+def _emit_site_drift(site: str, url: str, evidence: dict) -> None:
+    """Notify listeners of a suspected selector drift. Never raises."""
+    with _lock:
+        listeners = list(_drift_listeners)
+    for cb in listeners:
+        try:
+            cb(site, url, evidence)
+        except Exception as e:
+            logger.warning('[Providers] site-drift listener failed for %s: %s',
+                           site, e)
