@@ -16,12 +16,20 @@ network/Playwright hop is monkeypatched) and assert the OUTCOME:
   * when Playwright succeeds, the browser is NEVER consulted (over-trigger
     guard).
 
+0.7.0 contract strengthening (SITE_KNOWLEDGE_LAYER_DESIGN.md): for an
+auth-source-matched (login-walled) domain the browser is no longer the LAST
+resort — it is tried FIRST (live session beats stored-cookie replay: native
+signing, same IP/fingerprint; the server-side replay is the classic account
+risk-control trigger). The replay becomes the fallback, and the old
+``auth_source_failed`` post-replay escalation is subsumed by the single
+``auth_source_browser_first`` call.
+
 NEUTER anchors (deleting the seam line must turn the matching test red):
   * test_spa_shell_falls_to_browser            — the spa_shell seam
   * test_bot_wall_html_falls_to_browser        — the raw-HTML login_wall seam
   * test_bot_text_falls_to_browser             — the post-extraction login_wall seam
   * test_known_spa_falls_to_browser            — the known_spa seam
-  * test_auth_source_failure_falls_to_browser  — the auth_source_failed seam
+  * test_auth_source_browser_first_delivers    — the auth_source_browser_first seam
 
 All offline: no network, no real browser, no real Playwright.
 """
@@ -183,7 +191,7 @@ def test_known_spa_falls_to_browser(monkeypatch, harness):
 
 
 # ══════════════════════════════════════════════════════════
-#  4. Auth-source replay failure (stale stored cookies)
+#  4. Auth-source domain: the browser is the FIRST identity (0.7.0)
 # ══════════════════════════════════════════════════════════
 
 class _FakeAuthProvider:
@@ -203,22 +211,45 @@ def _register_auth_row():
     return row
 
 
-def test_auth_source_failure_falls_to_browser(monkeypatch, harness):
+def test_auth_source_browser_first_delivers(monkeypatch, harness):
+    """Browser-first: the live session answers, the replay is never risked."""
     _register_auth_row()
-    monkeypatch.setattr(core, '_try_authenticated_fetch', lambda url, src, mc, t: None)
+    monkeypatch.setattr(core, '_try_authenticated_fetch',
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError('cookie replay must not fire when the browser delivers')))
     _browser_returning(monkeypatch, harness, _BROWSER_TEXT)
 
     out = core.fetch_page_content('https://walled.example.com/home', max_chars=50000)
 
     assert out == _BROWSER_TEXT
-    assert harness['browser'] == ['auth_source_failed']
+    assert harness['browser'] == ['auth_source_browser_first']
     assert harness['do_request'] == 0, (
-        'a registered-but-failed source means the domain is known login-walled; '
+        'a registered source means the domain is known login-walled; '
         'the anonymous GET must be skipped once the browser delivers')
 
 
-def test_auth_source_failure_browser_empty_continues_anonymous(monkeypatch, harness):
-    """Browser has nothing → the anonymous pipeline runs exactly as before."""
+def test_auth_source_browser_empty_falls_back_to_replay(monkeypatch, harness):
+    """Browser has nothing → the stored-cookie replay is the fallback…"""
+    _register_auth_row()
+    replay_calls = []
+
+    def fake_replay(url, src, mc, t):
+        replay_calls.append(url)
+        return 'content from the cookie replay fallback'
+
+    monkeypatch.setattr(core, '_try_authenticated_fetch', fake_replay)
+    monkeypatch.setattr(core, '_looks_like_login_wall', lambda text: False)
+
+    out = core.fetch_page_content('https://walled.example.com/home', max_chars=50000)
+
+    assert out == 'content from the cookie replay fallback'
+    assert harness['browser'] == ['auth_source_browser_first']
+    assert replay_calls == ['https://walled.example.com/home']
+    assert harness['do_request'] == 0
+
+
+def test_auth_source_all_identities_empty_continues_anonymous(monkeypatch, harness):
+    """Browser empty + replay empty → the anonymous pipeline runs exactly as before."""
     _register_auth_row()
     monkeypatch.setattr(core, '_try_authenticated_fetch', lambda url, src, mc, t: None)
     monkeypatch.setattr(core, '_extract_html_text', lambda html, limit, url=None: 'real public content' * 10)
@@ -226,8 +257,8 @@ def test_auth_source_failure_browser_empty_continues_anonymous(monkeypatch, harn
     out = core.fetch_page_content('https://walled.example.com/public', max_chars=50000)
 
     assert out == 'real public content' * 10
-    assert harness['browser'] == ['auth_source_failed']
-    assert harness['do_request'] == 1, 'anonymous pipeline must still run when the browser yields nothing'
+    assert harness['browser'] == ['auth_source_browser_first']
+    assert harness['do_request'] == 1, 'anonymous pipeline must still run when every identity path yields nothing'
 
 
 # ══════════════════════════════════════════════════════════

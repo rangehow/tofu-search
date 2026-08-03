@@ -108,14 +108,20 @@ def test_core_checks_the_wall_before_returning_auth_text():
         'returned as content and the browser escalation is unreachable')
 
 
-def test_browser_escalation_is_reachable_after_a_wall():
-    """The escalation must exist AND carry a wall-specific reason."""
+def test_browser_is_tried_before_the_cookie_replay():
+    """0.7.0: the live browser session is the FIRST identity for auth-source
+    domains (native signing, same IP/fingerprint); the stored-cookie replay —
+    the classic account risk-control trigger — is only the fallback. Pin the
+    ORDER at source level."""
     import inspect
     from tofu_search.fetch import core
     src = inspect.getsource(core.fetch_page_content)
-    assert 'auth_source_login_wall' in src, (
-        'a wall outcome must escalate with its own reason so the cause is '
-        'visible in logs and in the browser provider')
+    browser_pos = src.find('auth_source_browser_first')
+    replay_pos = src.find('_try_authenticated_fetch(')
+    assert browser_pos > 0, 'the browser-first escalation for auth domains vanished'
+    assert replay_pos > 0, 'the authenticated replay call vanished'
+    assert browser_pos < replay_pos, (
+        'the live browser session must be tried BEFORE the stored-cookie replay')
 
 
 def test_unrescued_wall_returns_a_typed_diagnosis():

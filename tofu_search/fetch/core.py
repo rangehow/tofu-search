@@ -178,6 +178,17 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
     if _auth_src:
         logger.debug('[Fetch] auth-source match domain=%s — %s',
                      _auth_src.get('domain'), url[:80])
+        # Live-session FIRST: the host browser rides the user's own logged-in
+        # session (native request signing, same IP/fingerprint as the site's
+        # trust decisions). The stored-cookie replay below ships the session
+        # to a headless server browser on a foreign IP — the classic account
+        # risk-control trigger — so it is the FALLBACK, never the primary.
+        browser_text = _try_browser_fetch(url, max_chars,
+                                          reason='auth_source_browser_first')
+        if browser_text:
+            logger.info('[Fetch] Browser-first OK for auth-source domain=%s — %s (%d chars)',
+                        _auth_src.get('domain'), url[:80], len(browser_text))
+            return browser_text
         auth_text = _try_authenticated_fetch(url, _auth_src, max_chars, timeout)
         # A NON-EMPTY result is not the same as a SUCCESSFUL one: an SSO login
         # wall is itself a full page, so returning it here reported the replay
@@ -185,8 +196,8 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
         # caller then got the wall as if it were the article. Judge the CONTENT.
         if auth_text and _looks_like_login_wall(auth_text):
             logger.info('[Fetch] auth-source replay returned a LOGIN WALL (%d chars) '
-                        '— stored cookies were not accepted by the site; '
-                        'escalating to the host browser — %s', len(auth_text), url[:80])
+                        '— stored cookies were not accepted by the site — %s',
+                        len(auth_text), url[:80])
             auth_text = None
             _auth_wall = True
         else:
@@ -195,17 +206,8 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             return auth_text
         logger.info('[Fetch] auth-source fetch yielded nothing, falling back '
                     'to anonymous pipeline — %s', url[:80])
-        # Stored cookies may be expired while the user's LIVE browser session
-        # is still valid — a registered source means this domain is known to be
-        # login-walled, so the anonymous pipeline below is near-certain to hit
-        # the same wall. Try the host browser first (no-op when unconnected).
-        browser_text = _try_browser_fetch(
-            url, max_chars,
-            reason='auth_source_login_wall' if _auth_wall else 'auth_source_failed')
-        if browser_text:
-            logger.info('[Fetch] Browser fallback OK after auth-source failure — %s (%d chars)',
-                        url[:80], len(browser_text))
-            return browser_text
+        # The browser was already consulted FIRST above, so an unrescued wall
+        # here means neither identity path could take over.
         if _auth_wall:
             # The replay hit a wall AND the browser could not take over. Report
             # the actionable cause instead of letting the anonymous pipeline

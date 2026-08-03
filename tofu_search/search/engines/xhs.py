@@ -46,7 +46,7 @@ from urllib.parse import quote
 
 from tofu_search.config import get_config
 from tofu_search.log import get_logger
-from tofu_search.providers import get_auth_source_provider
+from tofu_search.providers import get_auth_source_provider, get_browser_provider
 from tofu_search.search._common import clean_text
 
 logger = get_logger(__name__)
@@ -211,10 +211,43 @@ def _get_source():
         return None
 
 
+def _browser_connected() -> bool:
+    """True when the host browser channel is live and can take tab commands."""
+    provider = get_browser_provider()
+    if provider is None:
+        return False
+    try:
+        return bool(provider.is_connected())
+    except Exception as e:
+        logger.debug('[Search] XHS: browser is_connected failed: %s', e)
+        return False
+
+
+def _search_via_browser(url: str):
+    """Scrape the search page through the user's REAL logged-in browser.
+
+    The page's own JS signs every request and the IP/fingerprint match the
+    site's trust decisions — nothing is exported or replayed, which is exactly
+    what the server-side pool cannot offer. Returns the extractor's list
+    (possibly empty = REAL empty), or None when the browser path failed.
+    """
+    provider = get_browser_provider()
+    try:
+        return provider.scrape(url, wait_selector=_WAIT_SELECTOR,
+                               extractor_js=_EXTRACTOR_JS, timeout=20, scrolls=2)
+    except Exception as e:
+        logger.warning('[Search] XHS: browser scrape failed, will fall back '
+                       'to the pool: %s', e)
+        return None
+
+
 def xhs_search_available() -> bool:
-    """True when ``xiaohongshu.com`` is connected (enabled + has cookies)."""
+    """True when the source is enabled AND some identity path exists — stored
+    cookies (pool replay) OR the live browser (native session)."""
     src = _get_source()
-    return bool(src and src.get('enabled') and src.get('cookies'))
+    if not (src and src.get('enabled')):
+        return False
+    return bool(src.get('cookies')) or _browser_connected()
 
 
 def search_xhs(query, max_results=10, freshness=''):
@@ -227,8 +260,13 @@ def search_xhs(query, max_results=10, freshness=''):
     """
     t0 = time.time()
     src = _get_source()
-    if not (src and src.get('enabled') and src.get('cookies')):
-        logger.debug('[Search] XHS not connected — skipping')
+    if not (src and src.get('enabled')):
+        logger.debug('[Search] XHS not enabled — skipping')
+        return []
+    cookies = src.get('cookies') or []
+    browser_live = _browser_connected()
+    if not cookies and not browser_live:
+        logger.debug('[Search] XHS: no cookies and no live browser — skipping')
         return []
 
     cfg = get_config()
@@ -247,17 +285,29 @@ def search_xhs(query, max_results=10, freshness=''):
                     'skipping query=%r', query[:60])
         return []
 
-    from tofu_search.fetch.playwright_pool import _pw_pool
-
     url = _SEARCH_URL.format(kw=quote(query))
-    items = _pw_pool.search_authenticated(
-        url,
-        cookies=src.get('cookies') or [],
-        proxy=src.get('proxy') or '',
-        timeout=20,
-        extractor_js=_EXTRACTOR_JS,
-        wait_selector=_WAIT_SELECTOR,
-    )
+
+    # Browser-first: the user's live Chrome is the primary identity (native
+    # login/signing, matching IP+fingerprint); the pool's cookie replay — a
+    # headless browser on a foreign IP, THE account risk-control trigger —
+    # only runs when the browser path is unavailable (None), never when it
+    # merely returned zero cards ([] = real empty, feeds the backoff below).
+    items = None
+    via = 'none'
+    if browser_live:
+        items = _search_via_browser(url)
+        via = 'browser' if items is not None else 'none'
+    if items is None and cookies:
+        from tofu_search.fetch.playwright_pool import _pw_pool
+        items = _pw_pool.search_authenticated(
+            url,
+            cookies=cookies,
+            proxy=src.get('proxy') or '',
+            timeout=20,
+            extractor_js=_EXTRACTOR_JS,
+            wait_selector=_WAIT_SELECTOR,
+        )
+        via = 'pool'
     if not items:
         _GUARD.report_outcome(query, [], ttl_s=cfg.xhs_cache_ttl_s,
                               cooldown_s=cfg.xhs_backoff_cooldown_s)
@@ -283,6 +333,6 @@ def search_xhs(query, max_results=10, freshness=''):
 
     _GUARD.report_outcome(query, results, ttl_s=cfg.xhs_cache_ttl_s,
                           cooldown_s=cfg.xhs_backoff_cooldown_s)
-    logger.info('[Search] XHS: %d results in %.1fs query=%r',
-                len(results), time.time() - t0, query[:60])
+    logger.info('[Search] XHS: %d results in %.1fs via=%s query=%r',
+                len(results), time.time() - t0, via, query[:60])
     return results

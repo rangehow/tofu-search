@@ -79,6 +79,30 @@ class BrowserProvider:
         """
         return []
 
+    def scrape(self, url: str, *, wait_selector: str = '',
+               extractor_js: str = '[]', timeout: int = 20,
+               scrolls: int = 0) -> Optional[list]:
+        """Open ``url`` in a background tab, wait for ``wait_selector``, run
+        ``extractor_js`` in-page, and return its JSON result (list/dict).
+
+        Unlike :meth:`fetch_url` (extracted text) and :meth:`fetch_html` (raw
+        HTML), this returns STRUCTURED data the page rendered — search cards,
+        product lists — extracted by JS running inside the user's REAL session
+        (native cookies and request signing, nothing exported). Use it for
+        login-walled / risk-controlled sites where replaying stored cookies
+        from a server-side headless browser trips account risk control.
+
+        ``scrolls`` > 0 asks the host to scroll to the bottom that many times
+        (with a human-ish pause) before extracting — lazy-loaded feeds.
+
+        Return contract: a list/dict when the path WORKED (``[]`` is a REAL
+        empty result — the caller counts it toward risk-control backoff, never
+        re-hits via another transport); ``None`` when the browser path is
+        unavailable (caller falls back). Default returns None — hosts without
+        tab-level automation simply don't unlock structured scraping.
+        """
+        return None
+
 
 class AuthSourceProvider:
     """Interface for host-supplied authenticated-source lookups.
