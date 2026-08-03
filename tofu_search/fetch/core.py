@@ -176,38 +176,64 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
             logger.debug('[Fetch] auth-source lookup failed for %s: %s', url[:80], e)
             _auth_src = None
     if _auth_src:
-        logger.debug('[Fetch] auth-source match domain=%s — %s',
-                     _auth_src.get('domain'), url[:80])
-        # Live-session FIRST: the host browser rides the user's own logged-in
-        # session (native request signing, same IP/fingerprint as the site's
-        # trust decisions). The stored-cookie replay below ships the session
-        # to a headless server browser on a foreign IP — the classic account
-        # risk-control trigger — so it is the FALLBACK, never the primary.
-        browser_text = _try_browser_fetch(url, max_chars,
-                                          reason='auth_source_browser_first')
-        if browser_text:
-            logger.info('[Fetch] Browser-first OK for auth-source domain=%s — %s (%d chars)',
-                        _auth_src.get('domain'), url[:80], len(browser_text))
-            return browser_text
-        auth_text = _try_authenticated_fetch(url, _auth_src, max_chars, timeout)
-        # A NON-EMPTY result is not the same as a SUCCESSFUL one: an SSO login
-        # wall is itself a full page, so returning it here reported the replay
-        # as a success and made the browser escalation below UNREACHABLE. The
-        # caller then got the wall as if it were the article. Judge the CONTENT.
-        if auth_text and _looks_like_login_wall(auth_text):
-            logger.info('[Fetch] auth-source replay returned a LOGIN WALL (%d chars) '
-                        '— stored cookies were not accepted by the site — %s',
-                        len(auth_text), url[:80])
-            auth_text = None
-            _auth_wall = True
+        strategy = str(_auth_src.get('access_strategy') or 'browser_first').strip()
+        if strategy == 'public':
+            # The registry says this site needs NO identity — treat the match
+            # as advisory and let the anonymous pipeline serve it.
+            logger.debug('[Fetch] auth-source domain=%s access_strategy=public '
+                         '— skipping identity paths — %s',
+                         _auth_src.get('domain'), url[:80])
+            _auth_src = None
+    if _auth_src:
+        logger.debug('[Fetch] auth-source match domain=%s strategy=%s — %s',
+                     _auth_src.get('domain'), strategy, url[:80])
+        _auth_wall = False
+        _browser_reason = ('auth_source_browser_fallback'
+                           if strategy == 'cookies_replay'
+                           else 'auth_source_browser_first')
+
+        def _browser():
+            # Live-session: the host browser rides the user's own logged-in
+            # session (native request signing, same IP/fingerprint as the
+            # site's trust decisions).
+            text = _try_browser_fetch(url, max_chars, reason=_browser_reason)
+            if text:
+                logger.info('[Fetch] Browser OK for auth-source domain=%s — '
+                            '%s (%d chars)', _auth_src.get('domain'),
+                            url[:80], len(text))
+            return text
+
+        def _replay():
+            # Stored-cookie replay: ships the session to a headless server
+            # browser on a foreign IP — the classic account risk-control
+            # trigger. A NON-EMPTY result is not the same as a SUCCESSFUL
+            # one: an SSO login wall is itself a full page, so returning it
+            # here reported the replay as a success and made the browser
+            # escalation UNREACHABLE. Judge the CONTENT.
+            nonlocal _auth_wall
+            text = _try_authenticated_fetch(url, _auth_src, max_chars, timeout)
+            if text and _looks_like_login_wall(text):
+                logger.info('[Fetch] auth-source replay returned a LOGIN WALL '
+                            '(%d chars) — stored cookies were not accepted by '
+                            'the site — %s', len(text), url[:80])
+                _auth_wall = True
+                return None
+            return text
+
+        # Path ORDER comes from the registry's access_strategy (P2):
+        #   browser_first (default) — live session primary, replay fallback;
+        #   cookies_replay — the OLD order (risk-tolerant sites / browser
+        #   usually offline): replay primary, browser fallback.
+        text = None
+        if strategy == 'cookies_replay':
+            text = _replay() or _browser()
         else:
-            _auth_wall = False
-        if auth_text:
-            return auth_text
+            text = _browser() or _replay()
+        if text:
+            return text
         logger.info('[Fetch] auth-source fetch yielded nothing, falling back '
                     'to anonymous pipeline — %s', url[:80])
-        # The browser was already consulted FIRST above, so an unrescued wall
-        # here means neither identity path could take over.
+        # An unrescued wall here means neither identity path could take over.
         if _auth_wall:
             # The replay hit a wall AND the browser could not take over. Report
             # the actionable cause instead of letting the anonymous pipeline

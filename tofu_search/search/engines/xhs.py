@@ -340,6 +340,13 @@ def search_xhs(query, max_results=10, freshness=''):
     if not (src and src.get('enabled')):
         logger.debug('[Search] XHS not enabled — skipping')
         return []
+    strategy = str(src.get('access_strategy') or 'browser_first').strip()
+    if strategy == 'public':
+        # The registry says this site needs NO identity — the engine's whole
+        # value is the logged-in session, so there is nothing to do.
+        logger.debug('[Search] XHS: access_strategy=public — identity paths '
+                     'disabled, skipping')
+        return []
     cookies = src.get('cookies') or []
     browser_live = _browser_connected()
     if not cookies and not browser_live:
@@ -364,24 +371,61 @@ def search_xhs(query, max_results=10, freshness=''):
 
     url = _SEARCH_URL.format(kw=quote(query))
 
-    # Browser-first: the user's live Chrome is the primary identity (native
-    # login/signing, matching IP+fingerprint); the pool's cookie replay — a
-    # headless browser on a foreign IP, THE account risk-control trigger —
-    # only runs when the browser path is unavailable (None), never when it
-    # merely returned zero cards ([] = real empty, feeds the backoff below).
+    # Path ORDER comes from the registry's access_strategy (P2):
+    #   browser_first (default) — the user's live Chrome is primary (native
+    #     login/signing, matching IP+fingerprint); the pool's cookie replay —
+    #     a headless browser on a foreign IP, THE account risk-control
+    #     trigger — only runs when the browser path is unavailable (None),
+    #     never when it merely returned zero cards ([] = real empty, feeds
+    #     the backoff below).
+    #   cookies_replay — the OLD order, for risk-tolerant sites or a browser
+    #     that is usually offline: pool replay primary, browser fallback.
+    # Either way a path only falls through when it returned None
+    # (unavailable), never when it returned [] (real empty).
     items = None
     probe = None
     via = 'none'
-    if browser_live:
+
+    def _try_browser():
+        nonlocal items, probe, via
+        if not browser_live:
+            return
         got = _search_via_browser(url)
         if got is not None:
             items, probe = got
             via = 'browser'
+
+    def _try_pool():
+        nonlocal items, via
+        if not cookies:
+            return
+        from tofu_search.fetch.playwright_pool import _pw_pool
+        got = _pw_pool.search_authenticated(
+            url,
+            cookies=cookies,
+            proxy=src.get('proxy') or '',
+            timeout=20,
+            extractor_js=_EXTRACTOR_JS,
+            wait_selector=_WAIT_SELECTOR,
+        )
+        if got is not None:
+            items = got
+            via = 'pool'
+
+    if strategy == 'cookies_replay':
+        _try_pool()
+        if items is None:
+            _try_browser()
+    else:
+        _try_browser()
+        if items is None:
+            _try_pool()
+
     # Selector-drift signal: the page rendered note anchors (probe saw them)
     # yet extraction made ZERO cards — the selectors, not the query, are at
     # fault. Distinct from a real empty (anchors==0) and from a risk wall
-    # (a wall renders no note anchors at all). Emitted BEFORE the pool
-    # fallback because the pool runs the SAME selectors and drifts alike.
+    # (a wall renders no note anchors at all). Only the browser path carries
+    # a probe; the pool runs the SAME selectors and drifts alike.
     if via == 'browser' and not items and probe \
             and int(probe.get('anchors') or 0) > 0:
         logger.warning(
@@ -394,17 +438,6 @@ def search_xhs(query, max_results=10, freshness=''):
             'page_title': probe.get('title') or '',
             'knowledge': 'pinned' if _knowledge() else 'builtin',
         })
-    if items is None and cookies:
-        from tofu_search.fetch.playwright_pool import _pw_pool
-        items = _pw_pool.search_authenticated(
-            url,
-            cookies=cookies,
-            proxy=src.get('proxy') or '',
-            timeout=20,
-            extractor_js=_EXTRACTOR_JS,
-            wait_selector=_WAIT_SELECTOR,
-        )
-        via = 'pool'
     if not items:
         _GUARD.report_outcome(query, [], ttl_s=cfg.xhs_cache_ttl_s,
                               cooldown_s=cfg.xhs_backoff_cooldown_s)

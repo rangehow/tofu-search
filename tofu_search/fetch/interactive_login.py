@@ -149,6 +149,30 @@ def capture_login_cookies(domain: str, login_url: str, timeout_s: int = 180) -> 
         _login_lock.release()
 
 
+def _login_hints(domain: str) -> tuple:
+    """Cookie names signalling a completed login for ``domain``.
+
+    The host's site registry (AuthSourceProvider row ``fields`` — the same
+    spec the Settings UI renders one input per cookie from) is the single
+    source of truth; the module table below is only the standalone-library
+    fallback. This is the last per-site hardcode in the login flow —
+    internalizing a site no longer edits library code.
+    """
+    try:
+        from tofu_search.providers import get_auth_source_provider
+        provider = get_auth_source_provider()
+        row = provider.get_source(domain) if provider is not None else None
+        fields = (row or {}).get('fields') or []
+        names = tuple(f['name'] for f in fields
+                      if isinstance(f, dict) and f.get('name'))
+        if names:
+            return names
+    except Exception as e:
+        logger.debug('[Login] registry field hints unavailable for %s: %s',
+                     domain, e)
+    return _LOGIN_COOKIE_HINTS.get(domain, ())
+
+
 def _run_capture(domain: str, login_url: str, timeout_s: int) -> dict:
     try:
         from playwright.sync_api import sync_playwright
@@ -156,7 +180,7 @@ def _run_capture(domain: str, login_url: str, timeout_s: int) -> dict:
         logger.warning('[Login] Playwright import failed: %s', e)
         return {'ok': False, 'reason': 'unavailable', 'error': str(e)}
 
-    hints = _LOGIN_COOKIE_HINTS.get(domain, ())
+    hints = _login_hints(domain)
     logger.info('[Login] launching headful browser for %s -> %s (timeout=%ds)',
                 domain, login_url, timeout_s)
 

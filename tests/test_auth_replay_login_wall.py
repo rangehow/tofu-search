@@ -102,10 +102,15 @@ def test_core_checks_the_wall_before_returning_auth_text():
     wall_check = src.find('_looks_like_login_wall', replay)
     assert wall_check > replay, (
         'the replay result must be checked for a login wall')
-    naked_return = src.find('if auth_text:', wall_check)
-    assert naked_return > wall_check, (
-        'the wall check must PRECEDE the success return, otherwise the wall is '
-        'returned as content and the browser escalation is unreachable')
+    clean_return = src.find('return text', wall_check)
+    assert clean_return > wall_check, (
+        'the wall check must PRECEDE the clean-text return inside the _replay '
+        'closure, otherwise the wall is returned as content and the browser '
+        'escalation is unreachable')
+    consumed = src.find('_replay()', clean_return)
+    assert consumed > clean_return, (
+        'the success path must consume the wall-judging _replay() closure, '
+        'never the raw replay call')
 
 
 def test_browser_is_tried_before_the_cookie_replay():
