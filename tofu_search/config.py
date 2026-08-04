@@ -130,6 +130,18 @@ class SearchConfig:
     # metadata verticals use — but still well inside search_deadline_secs.
     vertical_travel_timeout: int = 25
 
+    # ── Travel vertical (FlyAI / 飞猪 MCP) ──
+    # The travel vertical's ANONYMOUS provider. The public flyai-cli npm
+    # package ships a built-in trial credential, which travel_flyai.py embeds
+    # — so an EMPTY value here means "use the bundled trial credential", NOT
+    # "provider disabled". Set FLYAI_API_KEY (and FLYAI_SIGN_SECRET when the
+    # signing secret rotates) to step off the shared trial quota.
+    flyai_api_key: str = field(
+        default_factory=lambda: os.environ.get('FLYAI_API_KEY', ''))
+    flyai_sign_secret: str = field(
+        default_factory=lambda: os.environ.get('FLYAI_SIGN_SECRET', ''))
+    flyai_mcp_endpoint: str = 'https://flyai.open.fliggy.com/mcp'
+
     # ── Xiaohongshu engine account-risk guard ──
     # XHS polices automated access at the ACCOUNT level (限流/滑块/封号), and
     # this engine fires on every web search while connected — so the engine

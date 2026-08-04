@@ -1,19 +1,23 @@
-"""Flight vertical — RollingGo (道旅) flight MCP.
+"""Flight vertical — provider chain: RollingGo (道旅) keyed, FlyAI (飞猪) anonymous.
 
-Two-hop lookup: ``searchAirports`` resolves free-text city names to IATA codes,
-then ``searchFlights`` returns the priced itinerary list. Both hops share one
-wall-clock budget so a slow upstream cannot blow the caller's search deadline.
+RollingGo path (``ROLLINGGO_API_KEY`` configured): two-hop lookup —
+``searchAirports`` resolves free-text city names to IATA codes, then
+``searchFlights`` returns the priced itinerary list. Its anonymous era ended
+2026-08-04 (the endpoint now answers 401 to keyless calls), so it is only
+attempted when a key is configured.
 
-Availability is decided PER TYPE, not per domain: this endpoint currently serves
-anonymous callers, so the flight vertical stays available with no credential and
-only retires itself if the server actually answers 401/403.
+FlyAI path (travel_flyai.py): zero-config fallback — and the only path when no
+key is configured — via the bundled trial credential of the public flyai-cli.
+
+Both share one wall-clock budget so a slow upstream cannot blow the caller's
+search deadline.
 """
 
 import re
 from datetime import date
 
 from tofu_search.config import get_config
-from tofu_search.search.vertical import _mcp, travel_slots
+from tofu_search.search.vertical import _mcp, travel_flyai, travel_slots
 from tofu_search.search.vertical.base import logger
 
 TYPE = 'flight'
@@ -34,27 +38,29 @@ META = {
 _CABIN_LABEL = {'ECONOMY': '经济舱', 'PREMIUM_ECONOMY': '超级经济舱',
                 'BUSINESS': '商务舱', 'FIRST': '头等舱'}
 
-# Flipped to True only when the upstream actually rejects an anonymous call, so
-# a keyless deployment stops re-hitting a wall it has already hit once.
-_credential_required = False
 
+def _today():
+    """The current local date, isolated so tests can pin the calendar.
 
-def _reset_availability():
-    """Test hook — clear the learned 'needs a credential' latch."""
-    global _credential_required
-    _credential_required = False
+    travel_slots is deliberately clock-free (``today`` is injected); the
+    handler is the caller that reads the clock. Keeping that read behind a
+    one-line function is what stops handler-level tests rotting as the
+    calendar moves past their literal query dates.
+    """
+    return date.today()
 
 
 def is_available(cfg=None):
-    """True when this type can serve a request right now.
+    """True while at least one provider can serve a flight request.
 
-    The endpoint is anonymous-capable, so a missing key is NOT disqualifying —
-    unless a previous call proved otherwise.
+    RollingGo only serves callers holding ``ROLLINGGO_API_KEY``; FlyAI ships a
+    bundled trial credential and is the keyless path, so the type is available
+    in a zero-config deployment unless FlyAI's credential has been rejected.
     """
     cfg = cfg or get_config()
     if bool(cfg.rollinggo_api_key):
         return True
-    return not _credential_required
+    return travel_flyai.is_available(cfg)
 
 
 def detect(q):
@@ -63,22 +69,17 @@ def detect(q):
         return None
     if not travel_slots.looks_like_flight(q):
         return None
-    if travel_slots.parse_flight_query(q, today=date.today()) is None:
+    if travel_slots.parse_flight_query(q, today=_today()) is None:
         return None
     return (TYPE, q, {})
 
 
 def _call(tool, arguments, *, cfg, timeout):
-    global _credential_required
     out = _mcp.call_tool(cfg.rollinggo_flight_endpoint, tool, arguments,
                          api_key=cfg.rollinggo_api_key, timeout=timeout,
                          label=f'flight/{tool}')
     if out is _mcp.UNAUTHORIZED:
-        if not cfg.rollinggo_api_key:
-            _credential_required = True
-            logger.warning('[Vertical] flight endpoint rejected the anonymous '
-                           'call — marking the flight vertical as requiring '
-                           'ROLLINGGO_API_KEY for this process')
+        logger.warning('[Vertical] flight endpoint rejected ROLLINGGO_API_KEY')
         return None
     return out
 
@@ -161,14 +162,29 @@ def _format_segments(segments):
 
 
 def search(identifier, params):
-    """Look up flights for a natural-language query."""
+    """Look up flights for a natural-language query.
+
+    Provider chain: RollingGo first when ``ROLLINGGO_API_KEY`` is configured
+    (paid quota, richer arguments), FlyAI as the anonymous fallback — and the
+    only path when no key is configured.
+    """
     cfg = get_config()
     if not is_available(cfg):
         return None
-    slots = travel_slots.parse_flight_query(identifier, today=date.today())
+    slots = travel_slots.parse_flight_query(identifier, today=_today())
     if slots is None:
         return None
+    if cfg.rollinggo_api_key:
+        out = _search_rollinggo(slots, cfg)
+        if out is not None:
+            return out
+        logger.info('[Vertical] flight: RollingGo path failed, falling back '
+                    'to FlyAI')
+    return travel_flyai.search_flights(slots, cfg=cfg)
 
+
+def _search_rollinggo(slots, cfg):
+    """RollingGo flight path: two-hop (searchAirports → searchFlights)."""
     timeout = cfg.vertical_travel_timeout
     try:
         origin = _resolve_code(slots.from_text, cfg=cfg, timeout=timeout)
@@ -263,5 +279,6 @@ def search(identifier, params):
                 'content': '\n'.join(parts), 'items': items,
                 'source': 'RollingGo 机票'}
     except Exception as e:
-        logger.warning('[Vertical] flight lookup failed for %r: %s', identifier, e)
+        logger.warning('[Vertical] RollingGo flight lookup failed for %r→%r: %s',
+                       slots.from_text, slots.to_text, e)
         return None

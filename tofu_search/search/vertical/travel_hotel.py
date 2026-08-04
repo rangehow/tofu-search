@@ -1,9 +1,10 @@
-"""Hotel vertical — RollingGo (道旅) hotel MCP.
+"""Hotel vertical — provider chain: RollingGo (道旅) keyed, FlyAI (飞猪) anonymous.
 
-Single-hop ``searchHotels`` lookup returning bookable inventory with live
-lowest-price confirmation. Unlike the flight endpoint this one is credentialed:
-without ``ROLLINGGO_API_KEY`` the type reports itself unavailable and is never
-advertised to the model.
+RollingGo path (``ROLLINGGO_API_KEY`` configured): single-hop ``searchHotels``
+lookup returning bookable inventory with live lowest-price confirmation.
+
+FlyAI path (travel_flyai.py): zero-config fallback — and the only path when no
+key is configured — so the hotel type is now available WITHOUT any credential.
 
 ``getHotelSearchTags`` / ``getHotelDetail`` are deliberately NOT called here —
 they belong to the booking chain, which stays with the full MCP client. The
@@ -13,7 +14,7 @@ vertical layer only does search-time enrichment.
 from datetime import date
 
 from tofu_search.config import get_config
-from tofu_search.search.vertical import _mcp, travel_slots
+from tofu_search.search.vertical import _mcp, travel_flyai, travel_slots
 from tofu_search.search.vertical.base import logger
 
 TYPE = 'hotel'
@@ -26,15 +27,28 @@ META = {
                    '住2晚 五星酒店", "hotels in Kyoto on 2026-08-03").',
     'examples': ['上海外滩附近后天入住的五星酒店', '三亚 8/3-8/5 酒店',
                  'hotels in Kyoto on 2026-08-03 for 2 nights'],
-    'requires_credential': True,
+    'requires_credential': False,
     'credential_env': 'ROLLINGGO_API_KEY',
 }
 
 
+def _today():
+    """The current local date, isolated so tests can pin the calendar (see
+    travel_flight._today)."""
+    return date.today()
+
+
 def is_available(cfg=None):
-    """True only when a RollingGo API key is configured."""
+    """True while at least one provider can serve a hotel request.
+
+    RollingGo needs ``ROLLINGGO_API_KEY``; FlyAI ships a bundled trial
+    credential, so the type is available in a zero-config deployment unless
+    FlyAI's credential has been rejected in this process.
+    """
     cfg = cfg or get_config()
-    return bool(cfg.rollinggo_api_key)
+    if bool(cfg.rollinggo_api_key):
+        return True
+    return travel_flyai.is_available(cfg)
 
 
 def detect(q):
@@ -43,22 +57,37 @@ def detect(q):
         return None
     if not travel_slots.looks_like_hotel(q):
         return None
-    if travel_slots.parse_hotel_query(q, today=date.today()) is None:
+    if travel_slots.parse_hotel_query(q, today=_today()) is None:
         return None
     return (TYPE, q, {})
 
 
 def search(identifier, params):
-    """Look up hotels for a natural-language query."""
+    """Look up hotels for a natural-language query.
+
+    Provider chain: RollingGo first when ``ROLLINGGO_API_KEY`` is configured
+    (paid quota, live lowest-price confirmation), FlyAI as the anonymous
+    fallback — and the only path when no key is configured.
+    """
     cfg = get_config()
     if not is_available(cfg):
         return None
-    slots = travel_slots.parse_hotel_query(identifier, today=date.today())
+    slots = travel_slots.parse_hotel_query(identifier, today=_today())
     if slots is None:
         return None
+    if cfg.rollinggo_api_key:
+        out = _search_rollinggo(slots, cfg)
+        if out is not None:
+            return out
+        logger.info('[Vertical] hotel: RollingGo path failed, falling back '
+                    'to FlyAI')
+    return travel_flyai.search_hotels(slots, cfg=cfg)
 
+
+def _search_rollinggo(slots, cfg):
+    """RollingGo hotel path (searchHotels)."""
     args = {
-        'originQuery': slots.origin_query or identifier[:120],
+        'originQuery': slots.origin_query or slots.place,
         'place': slots.place,
         'placeType': slots.place_type,
         'checkInParam': {
@@ -129,5 +158,6 @@ def search(identifier, params):
                 'content': '\n'.join(parts), 'items': items,
                 'source': 'RollingGo 酒店'}
     except Exception as e:
-        logger.warning('[Vertical] hotel lookup failed for %r: %s', identifier, e)
+        logger.warning('[Vertical] RollingGo hotel lookup failed for %r: %s',
+                       slots.place, e)
         return None

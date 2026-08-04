@@ -14,17 +14,27 @@ from tofu_search import configure
 from tofu_search.search.vertical import (available_types, describe_domains,
                                          detect_vertical_intent, list_domains)
 from tofu_search.search.vertical import _mcp, base, registry
-from tofu_search.search.vertical import travel_flight, travel_hotel
+from tofu_search.search.vertical import (travel_flight, travel_flyai,
+                                         travel_hotel)
 from tofu_search.search.vertical import travel_slots as slots
 
 TODAY = date(2026, 7, 28)  # a Tuesday — pinned so relative-date tests can't rot
 
 
 @pytest.fixture(autouse=True)
-def _reset_flight_latch():
-    travel_flight._reset_availability()
+def _reset_flyai_latch():
+    travel_flyai._reset_availability()
     yield
-    travel_flight._reset_availability()
+    travel_flyai._reset_availability()
+
+
+@pytest.fixture(autouse=True)
+def _pin_handler_clock(monkeypatch):
+    """Pin the handlers' clock to TODAY so literal query dates in handler
+    tests never rot into the past (search/detect inject ``today`` into the
+    deliberately clock-free slot parsers)."""
+    monkeypatch.setattr(travel_flight, '_today', lambda: TODAY)
+    monkeypatch.setattr(travel_hotel, '_today', lambda: TODAY)
 
 
 # ── slot parsing: flights ──
@@ -303,6 +313,7 @@ def _flight_transport(calls):
 
 @pytest.mark.unit
 def test_flight_search_two_hop_builds_correct_args(monkeypatch):
+    configure(rollinggo_api_key='mcp_test')
     calls = []
     monkeypatch.setattr(base, '_post_json', _flight_transport(calls))
     out = travel_flight.search("2026-08-03 杭州飞成都机票", {})
@@ -338,19 +349,23 @@ def test_flight_search_past_date_makes_no_request(monkeypatch):
 
 
 @pytest.mark.unit
-def test_flight_401_latches_credential_requirement(monkeypatch):
+def test_flyai_401_latches_credential_rejection(monkeypatch):
+    """A 401 from FlyAI latches the anonymous provider off for the process,
+    and with no RollingGo key the whole travel domain goes dark with it."""
+    configure(rollinggo_api_key='')
     monkeypatch.setattr(base, '_post_json',
                         lambda *a, **kw: base._FETCH_UNAUTHORIZED)
     assert travel_flight.is_available() is True
     assert travel_flight.search("2026-08-03 杭州飞成都机票", {}) is None
-    # After a rejected anonymous call the type retires itself for this process.
+    assert travel_flyai.is_available() is False
     assert travel_flight.is_available() is False
-    assert 'travel' not in list_domains() or 'flight' not in available_types('travel')
+    assert 'travel' not in list_domains()
 
 
 @pytest.mark.unit
 def test_flight_items_declare_non_bookable_instead_of_dead_link(monkeypatch):
     """The provider returns no booking link for flights — say so explicitly."""
+    configure(rollinggo_api_key='mcp_test')
     monkeypatch.setattr(base, '_post_json', _flight_transport([]))
     out = travel_flight.search("2026-08-03 杭州飞成都机票", {})
     item = out['items'][0]
@@ -368,6 +383,7 @@ def test_resolve_picks_the_candidate_matching_the_query(monkeypatch):
     Taking it blindly yields a real priced quote for a route the user never
     asked for — undetectable downstream, hence the corroboration check.
     """
+    configure(rollinggo_api_key='mcp_test')
     calls = []
 
     def fake_post(url, *, payload, headers=None, **kw):
@@ -391,6 +407,7 @@ def test_resolve_picks_the_candidate_matching_the_query(monkeypatch):
 @pytest.mark.unit
 def test_unmatched_place_refuses_to_guess(monkeypatch):
     """No candidate corroborates the query → fail, do NOT price a guess."""
+    configure(rollinggo_api_key='mcp_test')
     calls = []
 
     def fake_post(url, *, payload, headers=None, **kw):
@@ -406,6 +423,8 @@ def test_unmatched_place_refuses_to_guess(monkeypatch):
 
 @pytest.mark.unit
 def test_iata_code_in_query_matches_exactly(monkeypatch):
+    configure(rollinggo_api_key='mcp_test')
+
     def fake_post(url, *, payload, headers=None, **kw):
         if payload['params']['name'] == 'searchAirports':
             return _envelope(_AIRPORTS_NOISY)
@@ -419,6 +438,7 @@ def test_iata_code_in_query_matches_exactly(monkeypatch):
 @pytest.mark.unit
 def test_both_endpoints_same_code_is_rejected(monkeypatch):
     """A degenerate route means a lookup latched onto the wrong candidate."""
+    configure(rollinggo_api_key='mcp_test')
     calls = []
 
     def fake_post(url, *, payload, headers=None, **kw):
@@ -447,6 +467,8 @@ def test_full_stack_sse_transport_to_handler_content(monkeypatch):
     this covers the seam between them, which is what actually breaks against a
     live ``streamable-http`` server.
     """
+    configure(rollinggo_api_key='mcp_test')
+
     def sse_body(payload):
         envelope = json.dumps(_envelope(payload), ensure_ascii=False)
         return f'event: message\ndata: {envelope}\n\n'
@@ -499,24 +521,19 @@ def test_hotel_search_builds_checkin_param(monkeypatch):
 # ── availability gating ──
 
 @pytest.mark.unit
-def test_hotel_unavailable_without_key_and_makes_no_request(monkeypatch):
+def test_hotel_available_without_key_via_flyai():
+    """Keyless: the hotel type now rides the FlyAI anonymous provider."""
     configure(rollinggo_api_key='')
-
-    def boom(*a, **kw):
-        raise AssertionError('must not call upstream without a credential')
-
-    monkeypatch.setattr(base, '_post_json', boom)
-    assert travel_hotel.is_available() is False
-    assert travel_hotel.detect("三亚 8/3-8/5 酒店") is None
-    assert travel_hotel.search("三亚 8/3-8/5 酒店", {}) is None
+    assert travel_hotel.is_available() is True
+    assert travel_hotel.detect("三亚 8/3-8/5 酒店") is not None
 
 
 @pytest.mark.unit
-def test_travel_domain_visible_with_flight_only():
-    """Keyless: flight stays usable, so the domain is still advertised."""
+def test_travel_domain_keyless_has_both_types():
+    """Keyless: FlyAI covers both types, so the whole domain is advertised."""
     configure(rollinggo_api_key='')
     assert 'travel' in list_domains()
-    assert available_types('travel') == ['flight']
+    assert available_types('travel') == ['flight', 'hotel']
 
 
 @pytest.mark.unit
@@ -526,15 +543,13 @@ def test_travel_domain_full_with_key():
 
 
 @pytest.mark.unit
-def test_describe_domains_reports_partial_availability():
+def test_describe_domains_reports_full_keyless_availability():
     configure(rollinggo_api_key='')
     entry = next(d for d in describe_domains() if d['domain'] == 'travel')
     assert entry['types'] == ['flight', 'hotel']
-    assert entry['available_types'] == ['flight']
-    assert entry['requires_credential'] is True
-    assert entry['credential_env'] == 'ROLLINGGO_API_KEY'
-    assert entry['unavailable_types'] == [
-        {'type': 'hotel', 'credential_env': 'ROLLINGGO_API_KEY'}]
+    assert entry['available_types'] == ['flight', 'hotel']
+    assert entry['requires_credential'] is False
+    assert entry['unavailable_types'] == []
     assert entry['examples']
 
 
@@ -545,18 +560,78 @@ def test_describe_domains_covers_every_listed_domain():
 
 
 @pytest.mark.unit
-def test_domain_fanout_skips_unavailable_type(monkeypatch):
-    """vertical='travel' on a hotel query with no key must not call upstream."""
+def test_domain_fanout_routes_hotel_to_flyai_keyless(monkeypatch):
+    """vertical='travel' on a hotel query with no key goes straight to FlyAI;
+    the RollingGo transport must never be touched."""
     configure(rollinggo_api_key='')
+    seen = {}
+
+    def fake_call(tool, args, **kw):
+        seen['tool'] = tool
+        return {'data': {'itemList': []}}
 
     def boom(*a, **kw):
-        raise AssertionError('gated type must never reach the transport')
+        raise AssertionError('RollingGo must not be called without a key')
 
+    monkeypatch.setattr(travel_flyai, 'call_tool', fake_call)
     monkeypatch.setattr(base, '_post_json', boom)
+    # Empty inventory → no record, but the FlyAI tool WAS the one invoked.
     assert registry.search_vertical_domain('travel', "三亚 8/3-8/5 酒店") is None
+    assert seen['tool'] == 'search_hotels'
 
 
 @pytest.mark.unit
+# ── provider chain ──
+
+@pytest.mark.unit
+def test_flight_keyless_goes_straight_to_flyai(monkeypatch):
+    """No RollingGo key: the RollingGo transport must not be touched."""
+    configure(rollinggo_api_key='')
+    sentinel = {'domain': 'travel', 'type': 'flight', 'content': 'x'}
+
+    def boom(*a, **kw):
+        raise AssertionError('RollingGo must not be called without a key')
+
+    monkeypatch.setattr(base, '_post_json', boom)
+    monkeypatch.setattr(travel_flyai, 'search_flights',
+                        lambda slots, **kw: sentinel)
+    assert travel_flight.search("2026-08-03 杭州飞成都机票", {}) is sentinel
+
+
+@pytest.mark.unit
+def test_flight_with_key_prefers_rollinggo(monkeypatch):
+    configure(rollinggo_api_key='mcp_test')
+    monkeypatch.setattr(base, '_post_json', _flight_transport([]))
+
+    def boom(*a, **kw):
+        raise AssertionError('FlyAI must not be called when RollingGo answers')
+
+    monkeypatch.setattr(travel_flyai, 'search_flights', boom)
+    out = travel_flight.search("2026-08-03 杭州飞成都机票", {})
+    assert out is not None
+    assert out['source'] == 'RollingGo 机票'
+
+
+@pytest.mark.unit
+def test_flight_falls_back_to_flyai_when_rollinggo_fails(monkeypatch):
+    configure(rollinggo_api_key='mcp_test')
+    monkeypatch.setattr(base, '_post_json', lambda *a, **kw: base._FETCH_FAILED)
+    sentinel = {'domain': 'travel', 'type': 'flight', 'content': 'x'}
+    monkeypatch.setattr(travel_flyai, 'search_flights',
+                        lambda slots, **kw: sentinel)
+    assert travel_flight.search("2026-08-03 杭州飞成都机票", {}) is sentinel
+
+
+@pytest.mark.unit
+def test_hotel_falls_back_to_flyai_when_rollinggo_fails(monkeypatch):
+    configure(rollinggo_api_key='mcp_test')
+    monkeypatch.setattr(base, '_post_json', lambda *a, **kw: base._FETCH_FAILED)
+    sentinel = {'domain': 'travel', 'type': 'hotel', 'content': 'x'}
+    monkeypatch.setattr(travel_flyai, 'search_hotels',
+                        lambda slots, **kw: sentinel)
+    assert travel_hotel.search("三亚 8/3-8/5 酒店", {}) is sentinel
+
+
 def test_travel_planner_routes_by_intent():
     plans = registry._travel_subtypes_for('travel', "8月3日北京到上海的机票")
     assert [p[0] for p in plans] == ['flight']
@@ -584,9 +659,8 @@ def test_detect_does_not_shadow_identifier_verticals():
 
 
 @pytest.mark.unit
-def test_detect_hotel_requires_key():
+def test_detect_hotel_keyless():
+    """Hotel intent detects with zero configuration (FlyAI anonymous path)."""
     configure(rollinggo_api_key='')
-    assert detect_vertical_intent("三亚 8/3-8/5 酒店") is None
-    configure(rollinggo_api_key='mcp_test')
     out = detect_vertical_intent("三亚 8/3-8/5 酒店")
     assert out is not None and out[0] == 'hotel'

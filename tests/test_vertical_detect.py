@@ -104,12 +104,13 @@ def test_domains_intact():
         "academic", "code", "finance", "security", "network", "travel"}
 
 
-def test_travel_domain_is_credential_gated():
-    """travel is listed by default only because its flight type is keyless."""
+def test_travel_domain_keyless_via_flyai():
+    """travel is fully advertised with zero configuration: the FlyAI
+    provider's bundled trial credential covers both types."""
     from tofu_search.search.vertical import available_types
 
     assert "travel" in list_domains()
-    assert available_types("travel") == ["flight"]
+    assert available_types("travel") == ["flight", "hotel"]
 
 
 def test_each_module_has_contract():

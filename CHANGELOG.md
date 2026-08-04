@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+- **FlyAI (飞猪) travel provider — the travel vertical's anonymous backend
+  (flight AND hotel now work with zero configuration).** RollingGo ended
+  anonymous flight access on 2026-08-04 (its endpoint now answers 401 to
+  keyless calls) and its hotel endpoint was always credentialed, which left
+  the whole `travel` domain dark without `ROLLINGGO_API_KEY`. The public
+  flyai-cli npm package (`@fly-ai/flyai-cli`) ships a built-in trial
+  credential and signs its MCP calls with a documented-in-bundle HMAC scheme;
+  the new `travel_flyai.py` re-implements that exact wire protocol on the
+  proxy-aware vertical HTTP layer (no Node runtime, no shell-out) and both
+  type handlers now run a provider chain: RollingGo first when
+  `ROLLINGGO_API_KEY` is set (paid quota, richer args), FlyAI as the
+  anonymous fallback — and the only path when no key is configured. FlyAI
+  flights come back WITH booking links (`bookable: true`, previously the
+  flight vertical could only say "query only"); trial-tier hotel prices are
+  masked upstream (`¥2xx`) and the content says so honestly. Override the
+  bundled credential via `FLYAI_API_KEY` / `FLYAI_SIGN_SECRET` (new config
+  fields `flyai_api_key` / `flyai_sign_secret` / `flyai_mcp_endpoint`). A 401
+  from FlyAI latches the provider off for the process, mirroring the old
+  RollingGo latch — anonymous upstreams are ephemeral by nature, the chain
+  absorbs it.
+
+### Fixed
+- **Handler-level travel tests rotted with the calendar.** `travel_slots` is
+  deliberately clock-free (`today` is injected), but the flight/hotel
+  handlers called `date.today()` directly, so every handler test pinning a
+  literal query date (e.g. `2026-08-03`) began failing the day the calendar
+  moved past it. The clock read now sits behind a one-line `_today()` seam
+  in both handlers and the test suite pins it.
+
 ## 0.6.0
 
 ### Added

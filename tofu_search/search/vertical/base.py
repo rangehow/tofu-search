@@ -114,8 +114,8 @@ def _decode_body(resp, label=''):
         return _FETCH_FAILED
 
 
-def _post_json(url, *, payload, headers=None, timeout=_TIMEOUT, label='',
-               retry_on_429=True, return_response=False):
+def _post_json(url, *, payload=None, headers=None, timeout=_TIMEOUT, label='',
+               retry_on_429=True, return_response=False, raw_body=None):
     """POST ``payload`` as JSON and return the decoded JSON object.
 
     The POST counterpart of :func:`_fetch_json`, and the single transport seam
@@ -134,7 +134,13 @@ def _post_json(url, *, payload, headers=None, timeout=_TIMEOUT, label='',
         hdrs.update(headers)
     for attempt in (0, 1):
         try:
-            resp = http_post(url, json=payload, headers=hdrs, timeout=timeout)
+            # raw_body is sent byte-for-byte (data=) — used by signed upstreams
+            # whose signature covers the exact body bytes, which a json=
+            # re-serialisation would change.
+            if raw_body is not None:
+                resp = http_post(url, data=raw_body, headers=hdrs, timeout=timeout)
+            else:
+                resp = http_post(url, json=payload, headers=hdrs, timeout=timeout)
         except Exception as e:
             logger.warning('[Vertical] %s POST failed for %s: %s', label or 'post', url[:80], e)
             return _FETCH_FAILED
