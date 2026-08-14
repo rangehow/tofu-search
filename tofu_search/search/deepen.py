@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 from tofu_search.config import get_config
 from tofu_search.fetch import fetch_page_content
 from tofu_search.log import get_logger
+from tofu_search.providers import submit_with_provider_context
+from tofu_search.search.dedup import canonical_url_key
 from tofu_search.search.rerank import _tokenize
 
 logger = get_logger(__name__)
@@ -66,13 +68,8 @@ def _harvest_links(results):
 
 
 def _dedup_key(url: str) -> str:
-    """Scheme/trailing-slash-insensitive key (mirrors orchestrator._url_dedup_key)."""
-    key = url.lower().rstrip('/')
-    for scheme in ('https://', 'http://'):
-        if key.startswith(scheme):
-            key = key[len(scheme):]
-            break
-    return key[:150]
+    """Shared canonical key for main results and deeper links."""
+    return canonical_url_key(url)
 
 
 def _domain(url: str) -> str:
@@ -149,7 +146,7 @@ def deepen_results(query, results, *, max_links=4, max_chars=None,
         return cand, content
 
     with ThreadPoolExecutor(max_workers=min(fetch_workers, len(chosen))) as pool:
-        futs = [pool.submit(_do_fetch, c) for c in chosen]
+        futs = [submit_with_provider_context(pool, _do_fetch, c) for c in chosen]
         for fut in as_completed(futs):
             try:
                 cand, content = fut.result()

@@ -94,6 +94,7 @@ def test_core_checks_the_wall_before_returning_auth_text():
     ORDER — the wall check has to sit between the replay and its `return`.
     """
     import inspect
+
     from tofu_search.fetch import core
     src = inspect.getsource(core.fetch_page_content)
 
@@ -119,6 +120,7 @@ def test_browser_is_tried_before_the_cookie_replay():
     the classic account risk-control trigger — is only the fallback. Pin the
     ORDER at source level."""
     import inspect
+
     from tofu_search.fetch import core
     src = inspect.getsource(core.fetch_page_content)
     browser_pos = src.find('auth_source_browser_first')
@@ -132,6 +134,7 @@ def test_browser_is_tried_before_the_cookie_replay():
 def test_unrescued_wall_returns_a_typed_diagnosis():
     """When the browser cannot take over, report WHY — never the wall itself."""
     import inspect
+
     from tofu_search.fetch import core
     src = inspect.getsource(core.fetch_page_content)
     assert 'auth_replay_rejected' in src

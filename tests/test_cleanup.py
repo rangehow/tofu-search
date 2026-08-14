@@ -35,6 +35,59 @@ def test_searxng_uses_config_instances(monkeypatch):
     assert seen and all(u.startswith('https://example.invalid') for u in seen)
 
 
+def test_searxng_prefers_self_host_and_respects_its_engine_config(monkeypatch):
+    configure(searxng_url='https://local.example',
+              searxng_instances=['https://public.invalid'],
+              searxng_engines='')
+    calls = []
+
+    class Resp:
+        ok = True
+        status_code = 200
+        headers = {'content-type': 'application/json'}
+        text = '{}'
+
+        @staticmethod
+        def json():
+            return {'results': [{'url': 'https://hit.example/a', 'title': 'hit'}]}
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs.get('params', {})))
+        return Resp()
+
+    monkeypatch.setattr(searxng.search_session, 'get', fake_get)
+    out = searxng.search_searxng('topic')
+    assert out
+    assert calls[0][0].startswith('https://local.example/')
+    assert 'engines' not in calls[0][1]
+
+
+def test_searxng_configured_engines_survive_html_fallback(monkeypatch):
+    configure(searxng_url='https://local.example',
+              searxng_instances=[], searxng_engines='mwmbl,pubmed')
+    calls = []
+
+    class Resp:
+        ok = False
+        status_code = 403
+        headers = {'content-type': 'text/html'}
+        text = ''
+
+        @staticmethod
+        def json():
+            return {}
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs.get('params', {}))
+        return Resp()
+
+    monkeypatch.setattr(searxng.search_session, 'get', fake_get)
+    out = searxng.search_searxng('topic')
+    assert out == []
+    assert calls[0]['engines'] == 'mwmbl,pubmed'
+    assert calls[1]['engines'] == 'mwmbl,pubmed'
+
+
 # ── format.py 0-result diagnostics ──
 
 def test_format_empty_no_diag():

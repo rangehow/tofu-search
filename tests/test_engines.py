@@ -164,12 +164,15 @@ def test_searxng_html_respects_max_results():
 
 def test_searxng_json_parser():
     data = {"results": [
-        {"url": "https://j.com/a", "title": "JA", "content": "ca"},
+        {"url": "https://j.com/a", "title": "JA", "content": "ca",
+         "engines": ["mwmbl", "brave"]},
         {"url": "", "title": "skip-no-url", "content": "x"},
     ]}
     out = _searxng_parse_json(data, max_results=6)
     assert len(out) == 1
     assert out[0]["url"] == "https://j.com/a"
+    assert out[0]["upstream_engines"] == ["mwmbl", "brave"]
+    assert out[0]["engine_count"] == 2
 
 
 # ── Engine circuit breaker ──

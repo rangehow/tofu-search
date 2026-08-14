@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.9.0 — 2026-08-14
+
+### Added
+- Query-focused passage selection for the LLM relevance gate and MCP output.
+  `web_search` now shares a configurable 18,000-character body budget across
+  sources while the ranker still sees full fetched pages.
+- Preferred self-hosted SearXNG configuration (`TOFU_SEARCH_SEARXNG_URL` /
+  `TOFU_SEARCH_SEARXNG_ENGINES`). Empty engine selection now respects the
+  instance configuration instead of hard-coding Google/Bing/DuckDuckGo.
+- MCP read-only/open-world tool annotations and explicit context-budget schema.
+- MCP 2026-07-28 support through the stable Python SDK v2, including direct
+  stateless requests while retaining legacy ChatUI handshake compatibility.
+
+### Changed
+- URL normalization removes fragments, default ports and known tracking query
+  parameters; duplicate engine hits contribute reciprocal-rank consensus.
+- Ranking now combines title-weighted BM25, primary-source authority, engine
+  consensus, successful extraction, entity coverage and host diversity.
+- Fetch work is capped at `max(12, max_results * 3)` candidates and streaming
+  submission reserves capacity across engines.
+- The minimal outbound MCP vertical client sends modern per-request metadata
+  and routing headers first, with a legacy initialize/session fallback.
+
+### Fixed
+- Race-to-N and engine timeout paths no longer rejoin the very slow worker
+  threads they had just cancelled, so their advertised latency bounds now hold.
+- Empty-result retries and the 25-second browser fallback are not started when
+  the remaining whole-search deadline cannot accommodate them.
+- Fetched mirrors/syndicated copies are removed before optional LLM filtering.
+
 ## 0.8.0
 
 ### Added

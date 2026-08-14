@@ -159,14 +159,13 @@ def test_http_calls_go_through_a_transport_seam(path, rel):
 
 
 def test_mcp_sdk_is_imported_from_exactly_one_place():
-    """The MCP SDK may only be reached via `from mcp.server.fastmcp import FastMCP`.
+    """The MCP SDK may only be reached via `from mcp.server import MCPServer`.
 
     ★ This is what makes "migrating SDK major versions is an import change, not
     a rewrite" a fact rather than a hope.
 
-    The SDK's v1.x line is in maintenance mode with a v2 already released, so
-    the migration is a question of when. Confining the coupling to one import
-    and two call sites keeps that migration mechanical. The moment a second
+    Confining the coupling to one import and two call sites keeps future SDK
+    migrations mechanical. The moment a second
     module reaches into `mcp.server.lowlevel`, `mcp.types` or similar, the
     blast radius stops being knowable -- and it would happen gradually, one
     convenient import at a time, which is exactly the kind of drift a guard
@@ -176,7 +175,7 @@ def test_mcp_sdk_is_imported_from_exactly_one_place():
     if not server_root.exists():
         pytest.skip('mcp_server package not present')
 
-    allowed = ('mcp.server.fastmcp', 'FastMCP')
+    allowed = ('mcp.server', 'MCPServer')
     offenders = []
     for path in sorted(server_root.rglob('*.py')):
         tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
@@ -196,7 +195,7 @@ def test_mcp_sdk_is_imported_from_exactly_one_place():
 
     assert not offenders, (
         'the MCP SDK must be reached only via '
-        '`from mcp.server.fastmcp import FastMCP`, so a future SDK migration '
+        '`from mcp.server import MCPServer`, so a future SDK migration '
         f'stays an import change rather than a rewrite. Found: {offenders}')
 
 

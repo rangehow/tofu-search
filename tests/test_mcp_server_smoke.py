@@ -19,7 +19,8 @@ import pytest
 
 pytest.importorskip('mcp', reason='MCP SDK not installed (pip install "tofu-search[mcp]")')
 
-PROTOCOL_VERSION = '2025-06-18'
+LEGACY_PROTOCOL_VERSION = '2025-11-25'
+CURRENT_PROTOCOL_VERSION = '2026-07-28'
 
 
 def _frame(payload: dict) -> str:
@@ -31,7 +32,7 @@ def _handshake_script(*requests: dict) -> str:
     script = _frame({
         'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
         'params': {
-            'protocolVersion': PROTOCOL_VERSION,
+            'protocolVersion': LEGACY_PROTOCOL_VERSION,
             'capabilities': {},
             'clientInfo': {'name': 'smoke-test', 'version': '0'},
         },
@@ -70,6 +71,36 @@ def _run_server(*requests: dict):
     return responses, proc.stdout
 
 
+def _run_modern_server(*requests: dict):
+    """Send 2026-07-28 self-contained requests with no initialize exchange."""
+    framed = ''
+    for request in requests:
+        params = request.setdefault('params', {})
+        params['_meta'] = {
+            'io.modelcontextprotocol/protocolVersion': CURRENT_PROTOCOL_VERSION,
+            'io.modelcontextprotocol/clientCapabilities': {},
+            'io.modelcontextprotocol/clientInfo': {
+                'name': 'modern-smoke-test', 'version': '0',
+            },
+        }
+        framed += _frame(request)
+
+    proc = subprocess.run(
+        [sys.executable, '-m', 'tofu_search.mcp_server', '--transport', 'stdio'],
+        input=framed,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    responses = {}
+    for line in proc.stdout.splitlines():
+        if line.strip():
+            msg = json.loads(line)
+            if 'id' in msg:
+                responses[msg['id']] = msg
+    return responses, proc.stdout, proc.stderr
+
+
 @pytest.fixture(scope='module')
 def handshake():
     """initialize + tools/list against a live server subprocess."""
@@ -80,6 +111,14 @@ def handshake():
 def resources():
     """initialize + resources/list against a live server subprocess."""
     return _run_server({'jsonrpc': '2.0', 'id': 3, 'method': 'resources/list'})
+
+
+@pytest.fixture(scope='module')
+def modern_tools():
+    """2026-07-28 tools/list without a legacy initialize handshake."""
+    return _run_modern_server({
+        'jsonrpc': '2.0', 'id': 20, 'method': 'tools/list', 'params': {},
+    })
 
 
 def test_stdout_carries_only_json_rpc(handshake):
@@ -102,6 +141,25 @@ def test_initialize_returns_server_info(handshake):
     result = responses[1]['result']
     assert result['protocolVersion']
     assert result['serverInfo']['name'] == 'tofu-search'
+
+
+def test_current_protocol_needs_no_initialize(modern_tools):
+    responses, raw, stderr = modern_tools
+    assert 20 in responses, (
+        '2026-07-28 request was not answered without initialize; '
+        f'stdout={raw[:300]!r}, stderr={stderr[:500]!r}')
+    assert 'error' not in responses[20], responses[20]
+    result = responses[20]['result']
+    names = {tool['name'] for tool in result['tools']}
+    assert 'web_search' in names
+    # 2026-07-28 list responses are cacheable/deterministic and identify the
+    # server per response rather than through a one-time handshake.
+    assert 'ttlMs' in result
+    assert 'cacheScope' in result
+    assert result['_meta']['io.modelcontextprotocol/serverInfo']['name'] == 'tofu-search'
+    search_tool = next(tool for tool in result['tools']
+                       if tool['name'] == 'web_search')
+    assert search_tool['outputSchema']['type'] == 'object'
 
 
 def test_all_four_tools_are_advertised(handshake):
@@ -133,6 +191,23 @@ def test_every_tool_has_a_substantial_description(handshake):
         assert len(desc) > 200, (
             f'{tool["name"]} has a {len(desc)}-char description; too thin to '
             'steer tool selection')
+
+
+def test_tools_declare_read_only_open_world_annotations(handshake):
+    responses, _ = handshake
+    for tool in responses[2]['result']['tools']:
+        annotations = tool.get('annotations') or {}
+        assert annotations.get('readOnlyHint') is True
+        assert annotations.get('destructiveHint') is False
+        assert annotations.get('idempotentHint') is True
+        assert annotations.get('openWorldHint') is True
+
+
+def test_web_search_schema_exposes_context_budget(handshake):
+    responses, _ = handshake
+    search = next(t for t in responses[2]['result']['tools']
+                  if t['name'] == 'web_search')
+    assert 'content_budget_chars' in search['inputSchema']['properties']
 
 
 def test_vertical_description_is_generated_from_the_live_registry(handshake):

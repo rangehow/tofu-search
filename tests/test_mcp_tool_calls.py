@@ -8,7 +8,7 @@ auto path passed the query where the dispatcher expects a registered TYPE name,
 so every auto lookup silently matched no handler and fell through to the
 "nothing matched" reply. tools/list was green throughout.
 
-These run IN-PROCESS against the FastMCP object rather than over a subprocess,
+These run IN-PROCESS against the MCPServer object rather than over a subprocess,
 because a tool result has to be inspected as structured data, and because the
 HTTP seam must be patched -- which is impossible across a process boundary.
 Network-touching tools (web_search, fetch_page) are exercised with their
@@ -46,8 +46,14 @@ def _sync_call(server, name: str, args: dict):
 
 async def _acall(server, name: str, args: dict):
     result = await server.call_tool(name, args)
-    # FastMCP returns (content_blocks, structured_payload) for structured tools
-    # and a bare content list otherwise; normalise both shapes.
+    # MCP SDK v2 returns CallToolResult.  Keep the older shapes in this tiny
+    # normaliser so assertion failures stay readable when bisecting across the
+    # SDK migration.
+    if hasattr(result, 'content'):
+        blocks = result.content
+        structured = getattr(result, 'structured_content', None)
+        text = '\n'.join(getattr(b, 'text', '') or '' for b in blocks)
+        return text, structured
     if isinstance(result, tuple):
         blocks, structured = result
     else:
@@ -224,6 +230,26 @@ def test_web_search_passes_diagnostics_through_on_zero_results(server, monkeypat
 
     assert 'network error' in text.lower(), (
         f'_search_diag was not forwarded to the formatter; got {text[:300]!r}')
+
+
+def test_web_search_applies_shared_context_budget(server, monkeypatch):
+    from tofu_search.mcp_server import server as server_mod
+    from tofu_search.search.orchestrator import SearchResultList
+
+    rows = SearchResultList([
+        {'title': f'Source {i}', 'url': f'https://s{i}.example/a',
+         'source': 'test', 'snippet': 'quasar benchmark',
+         'full_content': 'quasar benchmark fact ' * 4_000}
+        for i in range(3)
+    ])
+    monkeypatch.setattr(server_mod, 'perform_web_search', lambda *a, **kw: rows)
+
+    text, _ = _sync_call(server, 'web_search', {
+        'query': 'quasar benchmark', 'content_budget_chars': 4_000})
+
+    assert text.count('URL:') == 3
+    assert len(text) < 7_000
+    assert 'Query-Focused Excerpts' in text
 
 
 def test_fetch_page_failure_is_explained_not_silent(server, monkeypatch):

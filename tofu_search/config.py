@@ -28,6 +28,9 @@ class SearchConfig:
     fetch_max_chars_direct: int = 200_000
     fetch_max_chars_pdf: int = 0  # 0 = unlimited
     fetch_max_bytes: int = 20 * 1024 * 1024  # 20 MB
+    # Host-level search profiles may enable one-hop link deepening.  Kept as a
+    # plain boolean here so standalone callers can configure it directly.
+    deepen_enabled: bool = False
 
     # ── Wall-clock deadlines (robustness against wedged/dead hosts) ──
     # Total budget for ONE perform_web_search() call. When exceeded, the
@@ -101,6 +104,18 @@ class SearchConfig:
     })
 
     # ── SearXNG public instances (rotated to spread load / survive blocks) ──
+    # A self-hosted instance is tried FIRST and is never shuffled away. It can
+    # expose the JSON API and a much broader engine set without depending on
+    # the policy/rate limits of public instances. Env: TOFU_SEARCH_SEARXNG_URL.
+    searxng_url: str = field(
+        default_factory=lambda: os.environ.get('TOFU_SEARCH_SEARXNG_URL', ''))
+    # Empty means "respect the instance's enabled engines". Hard-coding only
+    # google,bing,duckduckgo defeats SearXNG's useful free/vertical providers
+    # (Mwmbl, OpenAlex, PubMed, GitHub, Marginalia, ...). Override with a
+    # comma-separated list only when deterministic routing is required.
+    # Env: TOFU_SEARCH_SEARXNG_ENGINES.
+    searxng_engines: str = field(
+        default_factory=lambda: os.environ.get('TOFU_SEARCH_SEARXNG_ENGINES', ''))
     # Public instances churn — override this list when the defaults go stale.
     searxng_instances: list = field(default_factory=lambda: [
         'https://search.indst.eu',
@@ -178,8 +193,8 @@ class SearchConfig:
 
     # ── Content filter settings ──
     filter_enabled: bool = True
-    # 'gate'    — relevance verdict ONLY: the LLM reads the head of the page
-    #             (capped at gate_input_max_chars) and answers [USEFUL] /
+    # 'gate'    — relevance verdict ONLY: the LLM reads the page opening plus
+    #             query-focused excerpts (capped at gate_input_max_chars) and answers [USEFUL] /
     #             §§IRRELEVANT§§ — a handful of output tokens. Useful pages keep
     #             their ORIGINAL extracted text. Fast (~1-3s/page).
     # 'rewrite' — the LLM regenerates the whole cleaned page verbatim (the
@@ -192,8 +207,8 @@ class SearchConfig:
     # (filtering is an enhancement, never a blocker). Raise it if you run
     # rewrite mode against big pages. Was 300 before 0.6.
     filter_timeout: int = 45
-    # Gate mode judges relevance from the head of the page — the full body is
-    # never sent to the LLM, which kills the prompt-processing cost too.
+    # Gate mode judges relevance from bounded selected passages — the full body
+    # is never sent to the LLM, which kills the prompt-processing cost too.
     # Rewrite mode always sends the full text.
     gate_input_max_chars: int = 12_000
     # Result cache for the LLM filter, keyed on (mode, url, query,
@@ -201,6 +216,12 @@ class SearchConfig:
     # zero LLM calls. 0 disables. Mirrors the fetch cache's TTL+LRU pattern.
     filter_cache_ttl: int = 600
     filter_cache_max_size: int = 500
+
+    # Total extracted page characters included in the MCP web_search response.
+    # The fetch/ranking pipeline still sees the full pages; only model-facing
+    # output is reduced to query-focused passages. Env:
+    # TOFU_SEARCH_MCP_CONTENT_BUDGET_CHARS.
+    mcp_content_budget_chars: int = 18_000
 
     # ── Pre-fetch relevance gate ──
     # A cheap, no-LLM lexical check (title+snippet vs query terms) that runs
@@ -268,6 +289,9 @@ def configure(**kwargs) -> SearchConfig:
             'TOFU_SEARCH_PROXY_URL': ('proxy_url', str),
             'TOFU_SEARCH_PROXY_DUAL_ATTEMPT': ('proxy_dual_attempt', _as_bool),
             'TOFU_SEARCH_MIN_REQUEST_INTERVAL_MS': ('min_request_interval_ms', int),
+            'TOFU_SEARCH_SEARXNG_URL': ('searxng_url', str),
+            'TOFU_SEARCH_SEARXNG_ENGINES': ('searxng_engines', str),
+            'TOFU_SEARCH_MCP_CONTENT_BUDGET_CHARS': ('mcp_content_budget_chars', int),
             'ROLLINGGO_API_KEY': ('rollinggo_api_key', str),
             'TOFU_XHS_MIN_INTERVAL_S': ('xhs_min_interval_s', float),
             'TOFU_XHS_CACHE_TTL_S': ('xhs_cache_ttl_s', int),

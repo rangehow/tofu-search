@@ -2,12 +2,10 @@
 
 ★ SDK COUPLING IS DELIBERATELY CONFINED TO ONE IMPORT.
 
-``from mcp.server.fastmcp import FastMCP`` is the ONLY way this package may
-reach into the MCP SDK -- no submodule imports, no reaching for internals. The
-SDK's v1.x line is in maintenance mode with a v2 already released, so the
-migration is a matter of when, not if. Keeping the coupling to one import and
-two call sites (``@mcp.tool`` / ``mcp.run``) is what makes "migrating is an
-import change, not a rewrite" true rather than aspirational. A guard in
+``from mcp.server import MCPServer`` is the ONLY way this package may reach
+into the MCP SDK -- no submodule imports, no reaching for internals.  SDK v2
+serves both the stateless 2026-07-28 protocol and legacy handshake clients, so
+old ChatUI integrations and current MCP hosts use the same server.  A guard in
 tests/test_plugin_contract.py fails the build if a second SDK import appears.
 
 The tool surface is deliberately NARROW. ``tofu_search`` exports 20+ symbols,
@@ -27,8 +25,10 @@ tool:
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
+from tofu_search import __version__
+from tofu_search.config import get_config
 from tofu_search.fetch.core import fetch_page_content, get_fetch_cache_stats
 from tofu_search.log import get_logger
 from tofu_search.mcp_server._bridge import get_limiter, run_blocking
@@ -46,6 +46,13 @@ from tofu_search.verify import summarize, verify_bibtex, verify_references
 logger = get_logger(__name__)
 
 SERVER_NAME = 'tofu-search'
+
+_READ_ONLY_OPEN_WORLD = {
+    'readOnlyHint': True,
+    'destructiveHint': False,
+    'idempotentHint': True,
+    'openWorldHint': True,
+}
 
 SERVER_INSTRUCTIONS = """\
 Web research tools: multi-engine search with page content already fetched,
@@ -113,12 +120,17 @@ def _vertical_description() -> str:
     return '\n'.join(lines)
 
 
-def build_server() -> FastMCP:
+def build_server() -> MCPServer:
     """Construct the MCP server with its tools and resources registered."""
-    mcp = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
+    mcp = MCPServer(
+        SERVER_NAME,
+        version=__version__,
+        instructions=SERVER_INSTRUCTIONS,
+    )
 
     @mcp.tool(
         name='web_search',
+        annotations=_READ_ONLY_OPEN_WORLD,
         description=(
             'Search the web across multiple engines (DuckDuckGo, Brave, Bing, '
             'SearXNG, Marginalia) in parallel and return results whose page '
@@ -132,9 +144,13 @@ def build_server() -> FastMCP:
             'the returned content, then use `fetch_page` on any URL that needs '
             'more depth. One call can take up to ~45 seconds; prefer a single '
             'specific query over several vague ones. Results are returned as '
-            'formatted text, with each entry showing title, URL, source, an '
-            'authority label, and either full page content or a snippet plus '
-            'the reason the fetch failed.'
+            'formatted text, with each entry showing title, URL, engine '
+            'consensus, an authority label, and query-focused page excerpts. '
+            'The default shared excerpt budget is 18,000 Unicode characters '
+            'across all sources (the exact token count depends on language and '
+            'the host model); increase `content_budget_chars` only when the '
+            'question genuinely needs more source detail. '
+            '`max_results` is clamped to 1..12.'
         ),
     )
     async def web_search(
@@ -143,8 +159,10 @@ def build_server() -> FastMCP:
         user_question: str = '',
         freshness: str = '',
         fetch_pages: bool = True,
+        content_budget_chars: int = 0,
     ) -> str:
         """Search the web; see the registered description for model guidance."""
+        max_results = max(1, min(int(max_results), 12))
         results = await run_blocking(
             perform_web_search,
             query,
@@ -154,10 +172,19 @@ def build_server() -> FastMCP:
             fetch_pages=fetch_pages,
         )
         diag = getattr(results, '_search_diag', None)
-        return format_search_for_tool_response(results, search_diag=diag, query=query)
+        budget = int(content_budget_chars or get_config().mcp_content_budget_chars)
+        budget = max(4_000, min(budget, 60_000))
+        return format_search_for_tool_response(
+            results,
+            search_diag=diag,
+            query=query,
+            max_total_content_chars=budget,
+            fetch_tool_name='fetch_page',
+        )
 
     @mcp.tool(
         name='fetch_page',
+        annotations=_READ_ONLY_OPEN_WORLD,
         description=(
             'Fetch and read one web page (HTML, PDF or plain text), returning '
             'cleaned article text rather than raw markup.\n\n'
@@ -177,6 +204,7 @@ def build_server() -> FastMCP:
         """Read a single URL; see the registered description."""
         if reason:
             logger.info('[MCP] fetch_page %s (reason=%s)', url[:100], reason[:80])
+        max_chars = max(1_000, min(int(max_chars), 500_000))
         content = await run_blocking(fetch_page_content, url, max_chars=max_chars)
         if not content:
             return (f'Could not read {url} — the fetch failed or the page had no '
@@ -184,7 +212,8 @@ def build_server() -> FastMCP:
                     'information exists; try web_search, or another URL.')
         return content
 
-    @mcp.tool(name='search_vertical', description=_vertical_description())
+    @mcp.tool(name='search_vertical', description=_vertical_description(),
+              annotations=_READ_ONLY_OPEN_WORLD)
     async def search_vertical_tool(query: str, domain: str = 'auto') -> str:
         """Authoritative lookup; see the generated description."""
         if domain and domain != 'auto':
@@ -217,6 +246,7 @@ def build_server() -> FastMCP:
 
     @mcp.tool(
         name='verify_citations',
+        annotations=_READ_ONLY_OPEN_WORLD,
         description=(
             'Check a bibliography for hallucinated or non-existent references '
             'against authoritative catalogues (CrossRef, arXiv, Semantic '

@@ -134,10 +134,14 @@ def main(argv: list[str] | None = None) -> int:
     server = build_server()
 
     if args.transport == 'http':
-        server.settings.host = args.host
-        server.settings.port = args.port
         logger.info('[MCP] serving Streamable HTTP on %s:%d', args.host, args.port)
-        server.run(transport='streamable-http')
+        # MCP SDK v2 owns transport configuration at run time.  The same
+        # endpoint accepts both modern stateless requests and legacy sessions.
+        server.run(
+            transport='streamable-http',
+            host=args.host,
+            port=args.port,
+        )
     else:
         # stdout belongs to the JSON-RPC stream from here on; all diagnostics
         # go to stderr (tofu_search.log never writes to stdout).

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tofu-search"
-version = "0.8.0"
+version = "0.9.0"
 description = "Multi-engine web search, vertical lookups, and content fetching with optional LLM filtering — standalone library from the Tofu AI assistant"
 readme = "README.md"
 license = {text = "MIT"}
@@ -51,12 +51,10 @@ pdf = ["pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
 # interface layer, not a capability, so it is deliberately excluded: a library
 # user who wants better extraction should not silently acquire a protocol SDK.
 all = ["playwright>=1.49", "pymupdf>=1.24", "pymupdf4llm>=0.0.17"]
-# Upper bound is intentional. v1.x is the SDK's only stable line and is in
-# maintenance mode; v2 exists but its client ecosystem is unproven, and the
-# SDK's own guidance is that dependants pin below it. tofu_search.mcp_server
-# touches exactly one SDK symbol, so moving the bound later is an import
-# change rather than a rewrite.
-mcp = ["mcp>=1.27,<2", "anyio>=4.0"]
+# SDK v2 speaks the stateless 2026-07-28 protocol and serves legacy handshake
+# clients from the same server, which keeps existing ChatUI configurations
+# compatible while allowing current MCP hosts to connect.
+mcp = ["mcp>=2,<3", "anyio>=4.9"]
 test = ["pytest>=8.0", "pytest-cov>=4.1"]
 dev = ["pytest>=8.0", "pytest-cov>=4.1", "ruff>=0.6"]
 
@@ -74,6 +72,7 @@ include = ["tofu_search*"]
 testpaths = ["tests"]
 addopts = "-ra -q"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = ["unit: offline unit test"]
 
 [tool.ruff]
 target-version = "py310"

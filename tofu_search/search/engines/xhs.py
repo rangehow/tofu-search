@@ -51,6 +51,7 @@ from tofu_search.providers import (
     get_auth_source_provider,
     get_browser_provider,
     get_site_knowledge_provider,
+    get_site_search_provider,
 )
 from tofu_search.search._common import clean_text
 
@@ -274,6 +275,20 @@ def _get_source():
 
 def _browser_connected() -> bool:
     """True when the host browser channel is live and can take tab commands."""
+    site_provider = get_site_search_provider()
+    if site_provider is not None:
+        try:
+            for source in site_provider.list_sources() or []:
+                if isinstance(source, str):
+                    source = {'id': source}
+                aliases = {str(a).lower() for a in source.get('aliases', [])} \
+                    if isinstance(source, dict) else set()
+                if isinstance(source, dict) and (
+                        str(source.get('id') or '').lower() in ('xiaohongshu', 'xhs')
+                        or 'xhs' in aliases):
+                    return True
+        except Exception as e:
+            logger.debug('[Search] XHS: site provider discovery failed: %s', e)
     provider = get_browser_provider()
     if provider is None:
         return False
@@ -284,7 +299,7 @@ def _browser_connected() -> bool:
         return False
 
 
-def _search_via_browser(url: str):
+def _search_via_browser(url: str, query: str = '', max_results: int = 10):
     """Scrape the search page through the user's REAL logged-in browser.
 
     The page's own JS signs every request and the IP/fingerprint match the
@@ -294,7 +309,19 @@ def _search_via_browser(url: str):
     or None when the browser path failed. Selectors come from the host's
     site-knowledge store when pinned (drift re-pin), else the built-ins.
     """
+    site_provider = get_site_search_provider()
+    if site_provider is not None:
+        try:
+            raw = site_provider.search('xiaohongshu', query,
+                                       max_results=max_results)
+            if raw is not None:
+                return _split_extraction(raw)
+        except Exception as e:
+            logger.warning('[Search] XHS: site-search provider failed, trying '
+                           'compat browser provider: %s', e)
     provider = get_browser_provider()
+    if provider is None:
+        return None
     k = _knowledge()
     wait_selector = (k or {}).get('wait_selector') or _WAIT_SELECTOR
     list_extractor = (k or {}).get('extractor_js') or _CARD_EXTRACT_JS
@@ -321,6 +348,8 @@ def _search_via_browser(url: str):
 def xhs_search_available() -> bool:
     """True when the source is enabled AND some identity path exists — stored
     cookies (pool replay) OR the live browser (native session)."""
+    if _browser_connected() and get_site_search_provider() is not None:
+        return True
     src = _get_source()
     if not (src and src.get('enabled')):
         return False
@@ -337,9 +366,12 @@ def search_xhs(query, max_results=10, freshness=''):
     """
     t0 = time.time()
     src = _get_source()
-    if not (src and src.get('enabled')):
+    site_provider_live = get_site_search_provider() is not None and _browser_connected()
+    if not (src and src.get('enabled')) and not site_provider_live:
         logger.debug('[Search] XHS not enabled — skipping')
         return []
+    if not src:
+        src = {'enabled': True, 'access_strategy': 'browser_first', 'cookies': []}
     strategy = str(src.get('access_strategy') or 'browser_first').strip()
     if strategy == 'public':
         # The registry says this site needs NO identity — the engine's whole
@@ -390,7 +422,7 @@ def search_xhs(query, max_results=10, freshness=''):
         nonlocal items, probe, via
         if not browser_live:
             return
-        got = _search_via_browser(url)
+        got = _search_via_browser(url, query=query, max_results=max_results)
         if got is not None:
             items, probe = got
             via = 'browser'

@@ -11,11 +11,18 @@ from datetime import date
 import pytest
 
 from tofu_search import configure
-from tofu_search.search.vertical import (available_types, describe_domains,
-                                         detect_vertical_intent, list_domains)
-from tofu_search.search.vertical import _mcp, base, registry
-from tofu_search.search.vertical import (travel_flight, travel_flyai,
-                                         travel_hotel)
+from tofu_search.search.vertical import (
+    _mcp,
+    available_types,
+    base,
+    describe_domains,
+    detect_vertical_intent,
+    list_domains,
+    registry,
+    travel_flight,
+    travel_flyai,
+    travel_hotel,
+)
 from tofu_search.search.vertical import travel_slots as slots
 
 TODAY = date(2026, 7, 28)  # a Tuesday — pinned so relative-date tests can't rot
@@ -262,6 +269,12 @@ def test_call_tool_sends_accept_and_bearer(monkeypatch):
     assert seen['headers']['Authorization'] == 'Bearer mcp_test'
     assert seen['payload']['method'] == 'tools/call'
     assert seen['payload']['params']['name'] == 'searchAirports'
+    assert seen['headers']['MCP-Protocol-Version'] == '2026-07-28'
+    assert seen['headers']['Mcp-Method'] == 'tools/call'
+    assert seen['headers']['Mcp-Name'] == 'searchAirports'
+    meta = seen['payload']['params']['_meta']
+    assert meta['io.modelcontextprotocol/protocolVersion'] == '2026-07-28'
+    assert meta['io.modelcontextprotocol/clientCapabilities'] == {}
 
 
 @pytest.mark.unit
@@ -275,6 +288,59 @@ def test_call_tool_omits_bearer_when_no_key(monkeypatch):
     monkeypatch.setattr(base, '_post_json', fake_post)
     _mcp.call_tool('https://x/mcp/flight', 'searchAirports', {'keyword': 'x'})
     assert 'Authorization' not in seen['headers']
+
+
+@pytest.mark.unit
+def test_call_tool_falls_back_to_legacy_session(monkeypatch):
+    calls = []
+
+    def fake_post(url, *, payload, headers=None, return_response=False, **kw):
+        calls.append((payload, headers, return_response))
+        if payload['method'] == 'tools/call' and len(calls) == 1:
+            return {'jsonrpc': '2.0', 'id': 1,
+                    'error': {'code': -32000, 'message': 'not initialized'}}
+        if payload['method'] == 'initialize':
+            class Resp:
+                headers = {'Mcp-Session-Id': 'legacy-session'}
+            return Resp()
+        if payload['method'] == 'notifications/initialized':
+            return object()
+        return _envelope({'ok': True})
+
+    monkeypatch.setattr(base, '_post_json', fake_post)
+    out = _mcp.call_tool('https://x/mcp/flight', 'searchAirports', {'keyword': 'x'})
+
+    assert out == {'ok': True}
+    assert [c[0]['method'] for c in calls] == [
+        'tools/call', 'initialize', 'notifications/initialized', 'tools/call']
+    assert calls[1][0]['params']['protocolVersion'] == '2025-11-25'
+    assert calls[2][1]['Mcp-Session-Id'] == 'legacy-session'
+    assert calls[3][1]['Mcp-Session-Id'] == 'legacy-session'
+    assert 'Mcp-Method' not in calls[3][1]
+    assert '_meta' not in calls[3][0]['params']
+
+
+@pytest.mark.unit
+def test_call_tool_falls_back_after_legacy_http_rejection(monkeypatch):
+    calls = []
+
+    def fake_post(url, *, payload, headers=None, return_response=False,
+                  return_error_response=False, **kw):
+        calls.append(payload['method'])
+        if len(calls) == 1:
+            assert return_error_response is True
+            return FakeResp(400, 'missing session')
+        if payload['method'] == 'initialize':
+            return FakeResp(200, '', headers={'Mcp-Session-Id': 's1'})
+        if payload['method'] == 'notifications/initialized':
+            return object()
+        return _envelope({'ok': True})
+
+    monkeypatch.setattr(base, '_post_json', fake_post)
+    out = _mcp.call_tool('https://x/mcp', 'searchAirports', {'keyword': 'x'})
+    assert out == {'ok': True}
+    assert calls == [
+        'tools/call', 'initialize', 'notifications/initialized', 'tools/call']
 
 
 # ── handlers ──

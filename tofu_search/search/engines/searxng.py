@@ -52,7 +52,12 @@ def _searxng_parse_json(data, max_results=6):
         title = item.get('title', '')
         if not url or not title:
             continue
-        results.append(make_result(title, item.get('content', ''), url, 'SearXNG'))
+        result = make_result(title, item.get('content', ''), url, 'SearXNG')
+        upstream = list(dict.fromkeys(item.get('engines') or []))
+        if upstream:
+            result['upstream_engines'] = upstream
+            result['engine_count'] = len(upstream)
+        results.append(result)
     return results
 
 
@@ -71,8 +76,12 @@ def search_searxng(query, max_results=6, freshness=''):
     cfg = get_config()
     shuffled = list(cfg.searxng_instances)
     random.shuffle(shuffled)
+    preferred = (getattr(cfg, 'searxng_url', '') or '').rstrip('/')
+    instances = ([preferred] if preferred else []) + [
+        inst.rstrip('/') for inst in shuffled if inst.rstrip('/') != preferred]
     _TIMEOUT = 2  # seconds — if SearXNG can't respond in 2s, it won't
-    _MAX_INSTANCES = 2  # try at most 2 instances (was 3)
+    # A configured self-host plus at most two public fallbacks.
+    _MAX_INSTANCES = 3 if preferred else 2
     # Resolve the preferred network path once (honours an explicit
     # config.proxy_url / the DIRECT env-bypass marker). SearXNG's own per-
     # instance rotation already provides path diversity, so we take just the
@@ -83,10 +92,13 @@ def search_searxng(query, max_results=6, freshness=''):
     _FRESHNESS_MAP = {'day': 'day', 'week': 'week', 'month': 'month', 'year': 'year'}
     time_range = _FRESHNESS_MAP.get(freshness, '')
 
-    for inst in shuffled[:_MAX_INSTANCES]:
+    for inst in instances[:_MAX_INSTANCES]:
         try:
             # Try JSON first (don't follow redirects — detect 302→homepage)
-            json_params = {'q': query, 'format': 'json', 'engines': 'google,bing,duckduckgo'}
+            json_params = {'q': query, 'format': 'json'}
+            configured_engines = (getattr(cfg, 'searxng_engines', '') or '').strip()
+            if configured_engines:
+                json_params['engines'] = configured_engines
             if time_range:
                 json_params['time_range'] = time_range
             resp = search_session.get(
@@ -117,6 +129,8 @@ def search_searxng(query, max_results=6, freshness=''):
             # JSON blocked (403) or empty — try HTML on same instance
             if resp.status_code == 403 or not json_results:
                 html_params = {'q': query}
+                if configured_engines:
+                    html_params['engines'] = configured_engines
                 if time_range:
                     html_params['time_range'] = time_range
                 resp = search_session.get(

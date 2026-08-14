@@ -19,7 +19,9 @@ stays dependency-free when used standalone.
   stock tickers, PyPI/npm packages, GitHub repos, IP addresses, Hugging Face
   daily papers, and Semantic Scholar related-work — answered from the relevant
   free API alongside web results.
-- **Content deduplication**: Jaccard similarity on shingles (CJK + Latin aware).
+- **Three-stage deduplication**: canonical URLs (fragments/tracking parameters
+  removed), SERP title/snippet similarity, then fetched-body mirror detection.
+  Cross-engine hits are retained as ranking consensus instead of discarded.
 - **Concurrent page fetching**: Race-to-N strategy with SSL fallback + a
   per-domain circuit breaker.
 - **Adaptive proxy strategy**: when a proxy is available each engine tries
@@ -29,9 +31,15 @@ stays dependency-free when used standalone.
   (single direct attempt) when no proxy is configured.
 - **One-hop deepening** *(opt-in)*: follow the best query-relevant outbound
   links one hop deeper, bounded like a crawl budget.
-- **LLM content filter** *(optional)*: relevance verdict + noise removal. When
-  no LLM is configured the step is silently skipped (raw text returned as-is).
-- **BM25 reranking**: pure-Python, no external API calls.
+- **LLM content filter** *(optional)*: a few-token relevance verdict by default;
+  opt-in `rewrite` mode can regenerate cleaned text. With no LLM, extracted
+  text passes through unchanged.
+- **BM25 + authority/coverage reranking**: pure Python, no external API calls;
+  includes search-engine consensus, primary-source preference, entity coverage,
+  and a two-result-per-domain diversity pass.
+- **Token-bounded MCP context**: full pages are used for ranking, while
+  `web_search` returns query-focused excerpts under one shared 18k-character
+  budget by default.
 - **SPA / bot-protection support**: optional Playwright fallback for
   JS-rendered and challenge pages.
 - **PDF extraction**: optional pymupdf / pymupdf4llm integration.
@@ -43,8 +51,9 @@ stays dependency-free when used standalone.
 - **Site readers**: pluggable per-domain handlers that read a site through its
   public endpoint instead of scraping the page.
 - **Host integration seams**: register a browser provider (fetch/search via a
-  real browser the user controls) and an auth-source provider (cookies/proxy
-  for login-walled domains) — both no-ops by default.
+  real browser the user controls), a read-only site-search provider (host-owned
+  authenticated adapters), and an auth-source provider (cookies/proxy for
+  login-walled domains) — all no-ops by default.
 
 ## Quick Start
 
@@ -205,8 +214,9 @@ library), exactly like a plugin.
 
 ```python
 from tofu_search import (
-    BrowserProvider, AuthSourceProvider,
-    register_browser_provider, register_auth_source_provider,
+    BrowserProvider, SiteSearchProvider, AuthSourceProvider,
+    register_browser_provider, register_site_search_provider,
+    register_auth_source_provider,
 )
 
 class MyBrowser(BrowserProvider):
@@ -218,7 +228,13 @@ class MyAuth(AuthSourceProvider):
     def match_source(self, url): ...      # → {'domain','cookies','proxy',...} | None
     def get_source(self, domain): ...
 
+class MySites(SiteSearchProvider):
+    def bind(self): ...                    # capture request/user identity
+    def list_sources(self): ...            # read-capable sources only
+    def search(self, source_id, query, *, max_results=10, freshness=''): ...
+
 register_browser_provider(MyBrowser())       # last-resort fetch/search fallback
+register_site_search_provider(MySites())     # authenticated site adapters
 register_auth_source_provider(MyAuth())      # cookies for login-walled domains
 ```
 
@@ -236,6 +252,11 @@ configure(
     fetch_timeout=15,              # HTTP timeout per request (seconds)
     fetch_max_chars_search=60000,  # Max chars per page in search results
     fetch_max_chars_direct=200000, # Max chars for direct fetch_url()
+
+    # Optional self-hosted SearXNG (preferred before public fallbacks)
+    searxng_url="http://searxng:8080",
+    searxng_engines="",            # Empty: respect the instance configuration
+    mcp_content_budget_chars=18000,
 
     # LLM settings (for content filter)
     llm_api_key="sk-...",
@@ -262,6 +283,9 @@ Semantic Scholar raises its rate limit with `SEMANTIC_SCHOLAR_API_KEY`. The
 adaptive proxy honours `TOFU_SEARCH_PROXY_URL` and
 `TOFU_SEARCH_PROXY_DUAL_ATTEMPT` (plus the standard `https_proxy` /
 `http_proxy` / `all_proxy`).
+For a stable, broader free backend, set `TOFU_SEARCH_SEARXNG_URL`; optionally
+pin its comma-separated engine list with `TOFU_SEARCH_SEARXNG_ENGINES`. See the
+[open-source backend review](docs/search-backends.md) for deployment tradeoffs.
 
 ## Pipeline
 
@@ -272,13 +296,20 @@ adaptive proxy honours `TOFU_SEARCH_PROXY_URL` and
    page fetch starts before slow engines finish). When a proxy is configured
    each engine adaptively tries both the proxied and direct network path and
    learns which one works (see the adaptive-proxy feature above).
-2. **URL dedup**: scheme/trailing-slash-insensitive keys.
+2. **URL aggregation**: canonicalize scheme/default ports/fragments/tracking
+   parameters, merge engine evidence, and accumulate reciprocal-rank consensus.
 3. **Content dedup**: Jaccard similarity on title+snippet shingles.
-4. **Page fetch**: concurrent HTTP with race-to-N; SSL retry, circuit breaker,
-   Playwright fallback for SPA/bot-protection pages.
+4. **Page fetch**: rank a bounded candidate set, reserve streaming capacity
+   across engines, then concurrent race-to-N with SSL retry, circuit breaker,
+   and Playwright fallback for SPA/bot-protection pages.
+   - **4a. Full-content dedup**: remove mirrors/syndicated copies before any
+     optional LLM call.
    - **4b. Deepen** *(opt-in)*: one hop along the best query-relevant links.
-5. **LLM content filter** *(optional)*: relevance verdict + noise removal.
-6. **BM25 rerank**: score documents against the query, select top-N.
+5. **LLM content filter** *(optional)*: bounded relevance verdict by default;
+   opt-in rewrite mode can regenerate cleaned text.
+6. **BM25/authority/consensus rerank**: select a relevant, source-diverse top-N.
+7. **MCP passage selection**: keep the full library result, but send ChatUI only
+   the best query-focused passages under a shared context budget.
 
 Step 5 is automatically skipped when no LLM is configured.
 
@@ -307,7 +338,6 @@ Or just run `./install.sh` (see below).
 ./install.sh --pdf
 ```
 
-## Concurrency & thread-safety
 ## Run as an MCP server
 
 The library can be exposed to any MCP client (Claude Desktop, IDE agents,
@@ -330,6 +360,18 @@ It exposes four tools — `web_search`, `fetch_page`, `search_vertical`,
 deliberately narrow: `configure()` and the `register_*` seams are NOT tools,
 because a per-request caller must not be able to change global state or
 supply implementations.
+
+The server uses MCP SDK v2 and speaks the current `2026-07-28` stateless
+protocol while accepting legacy `2025-*` initialize/session clients on the
+same stdio or Streamable HTTP endpoint. No ChatUI configuration split is
+required during migration.
+
+`web_search` accepts `content_budget_chars` (4,000–60,000). `0` uses
+`mcp_content_budget_chars` / `TOFU_SEARCH_MCP_CONTENT_BUDGET_CHARS`, whose
+default is 18,000 characters across all result bodies. Source metadata and URLs
+are always retained, so a model can call `fetch_page` when one source needs more
+depth instead of paying for every full page up front. This is a character cap,
+not an exact token count; CJK and Latin text tokenize differently.
 
 Design constraints an embedder should know (each enforced by a test):
 

@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tofu_search.config import get_config
 from tofu_search.fetch.utils import _FetchCache
 from tofu_search.log import get_logger
+from tofu_search.passages import select_relevant_passages
 
 logger = get_logger(__name__)
 
@@ -47,8 +48,8 @@ empty/broken pages (login wall, captcha, cookie wall, 404, access denied, blank 
 AND pages whose content is entirely unrelated to the user's question. \
 Generation stops immediately after this token.
 
-Only the first part of the page is shown. Judge from what you see: a page whose \
-opening is navigation chrome, an error, or a login wall with no substance is \
+The page opening and query-focused excerpts are shown. Judge from what you see: \
+a page whose opening is navigation chrome, an error, or a login wall with no substance is \
 §§IRRELEVANT§§; a page that opens like a real article is [USEFUL] even if the \
 shown part is only the beginning.
 
@@ -218,12 +219,18 @@ def filter_web_content(raw_text: str, *, url: str = '', query: str = '',
     _timeout = timeout or config.filter_timeout
 
     if mode == 'gate':
-        # Verdict-only: relevance is judgeable from the head of the page —
-        # the full body is never sent, killing prompt-processing cost too.
-        page_input = raw_text[:config.gate_input_max_chars]
+        # Keep the opening (page identity / login wall) plus query-focused
+        # excerpts. This uses the same input budget as the old head-only gate,
+        # but no longer rejects a long page whose useful section appears later.
+        page_input = select_relevant_passages(
+            raw_text,
+            ' '.join(part for part in (query, user_question) if part),
+            config.gate_input_max_chars,
+            include_lead=True,
+        )
         system_prompt = _GATE_SYSTEM_PROMPT
         content_header = (f'--- Raw page content '
-                          f'(first {len(page_input):,} of {len(raw_text):,} chars) ---')
+                          f'(selected {len(page_input):,} of {len(raw_text):,} chars) ---')
     else:
         page_input = raw_text
         system_prompt = _SYSTEM_PROMPT

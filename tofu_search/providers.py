@@ -28,6 +28,9 @@ anonymous pipeline rather than crashing it.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import functools
 import threading
 from typing import Optional
 
@@ -37,12 +40,15 @@ logger = get_logger(__name__)
 
 __all__ = [
     'BrowserProvider',
+    'SiteSearchProvider',
     'AuthSourceProvider',
     'SiteKnowledgeProvider',
     'register_browser_provider',
+    'register_site_search_provider',
     'register_auth_source_provider',
     'register_site_knowledge_provider',
     'get_browser_provider',
+    'get_site_search_provider',
     'get_auth_source_provider',
     'get_site_knowledge_provider',
     'register_site_drift_listener',
@@ -61,6 +67,15 @@ class BrowserProvider:
     def is_connected(self) -> bool:
         """Return True when the browser channel is live and usable."""
         return False
+
+    def bind(self) -> 'BrowserProvider':
+        """Return a request/task-bound view of this provider.
+
+        Hosts with per-user browser fleets override this to capture the
+        current user and browser identity before search work enters executor
+        threads. Standalone providers can remain process-global.
+        """
+        return self
 
     def fetch_url(self, url: str, *, max_chars: int | None = None,
                   timeout: int = 15) -> Optional[str]:
@@ -117,6 +132,32 @@ class BrowserProvider:
         return None
 
 
+class SiteSearchProvider:
+    """Optional host-owned, read-only authenticated site search seam.
+
+    The provider owns browser sessions and site adapters.  tofu-search only
+    orchestrates and normalizes returned records; standalone users need not
+    register anything.
+    """
+
+    def list_sources(self) -> list[dict]:
+        """Return available read sources.
+
+        Each item has at least ``id`` and may include ``name``, ``aliases``,
+        ``domains`` and ``metadata``.  Write-only sources must not be listed.
+        """
+        return []
+
+    def bind(self) -> 'SiteSearchProvider':
+        """Return a request/task-bound provider view (default: ``self``)."""
+        return self
+
+    def search(self, source_id: str, query: str, *, max_results: int = 10,
+               freshness: str = '') -> Optional[list[dict]]:
+        """Return results, ``[]`` for a real empty, or ``None`` if unavailable."""
+        return None
+
+
 class AuthSourceProvider:
     """Interface for host-supplied authenticated-source lookups.
 
@@ -151,9 +192,15 @@ class SiteKnowledgeProvider:
 
 _lock = threading.Lock()
 _browser_provider: Optional[BrowserProvider] = None
+_site_search_provider: Optional[SiteSearchProvider] = None
 _auth_source_provider: Optional[AuthSourceProvider] = None
 _site_knowledge_provider: Optional[SiteKnowledgeProvider] = None
 _drift_listeners: list = []
+_UNSET = object()
+_browser_provider_ctx = contextvars.ContextVar(
+    'tofu_search_browser_provider', default=_UNSET)
+_site_search_provider_ctx = contextvars.ContextVar(
+    'tofu_search_site_search_provider', default=_UNSET)
 
 
 def register_browser_provider(provider: Optional[BrowserProvider]) -> None:
@@ -162,6 +209,15 @@ def register_browser_provider(provider: Optional[BrowserProvider]) -> None:
     with _lock:
         _browser_provider = provider
     logger.info('[Providers] browser provider %s',
+                'registered' if provider else 'cleared')
+
+
+def register_site_search_provider(provider: Optional[SiteSearchProvider]) -> None:
+    """Install (or clear) the global read-only site-search provider."""
+    global _site_search_provider
+    with _lock:
+        _site_search_provider = provider
+    logger.info('[Providers] site-search provider %s',
                 'registered' if provider else 'cleared')
 
 
@@ -176,8 +232,83 @@ def register_auth_source_provider(provider: Optional[AuthSourceProvider]) -> Non
 
 def get_browser_provider() -> Optional[BrowserProvider]:
     """Return the registered browser provider, or None."""
+    scoped = _browser_provider_ctx.get()
+    if scoped is not _UNSET:
+        return scoped
     with _lock:
         return _browser_provider
+
+
+def get_site_search_provider() -> Optional[SiteSearchProvider]:
+    """Return the registered site-search provider, or None."""
+    scoped = _site_search_provider_ctx.get()
+    if scoped is not _UNSET:
+        return scoped
+    with _lock:
+        return _site_search_provider
+
+
+@contextlib.contextmanager
+def bound_optional_providers():
+    """Bind host providers once and carry them through a public operation."""
+    browser = get_browser_provider()
+    site_search = get_site_search_provider()
+    if browser is not None:
+        browser = browser.bind()
+    if site_search is not None:
+        site_search = site_search.bind()
+    btok = _browser_provider_ctx.set(browser)
+    stok = _site_search_provider_ctx.set(site_search)
+    try:
+        yield
+    finally:
+        _site_search_provider_ctx.reset(stok)
+        _browser_provider_ctx.reset(btok)
+
+
+def with_bound_optional_providers(fn):
+    """Decorator for public calls that may cross executor-thread boundaries."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with bound_optional_providers():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def submit_with_provider_context(pool, fn, /, *args, **kwargs):
+    """Submit work with the caller's bound-provider ContextVars copied."""
+    context = contextvars.copy_context()
+    return pool.submit(context.run, fn, *args, **kwargs)
+
+
+def normalize_site_search_results(items, *, source_id: str,
+                                  source_name: str = '',
+                                  max_results: int = 10) -> list[dict]:
+    """Normalize provider records to the stable search-result wire shape."""
+    if not isinstance(items, list):
+        return []
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get('title') or '').strip()
+        url = str(item.get('url') or '').strip()
+        if not title or not url.startswith(('http://', 'https://')):
+            continue
+        metadata = item.get('metadata') if isinstance(item.get('metadata'), dict) else {}
+        metadata = dict(metadata)
+        metadata.setdefault('site_source', source_id)
+        row = dict(item)
+        row.update({
+            'title': title[:500], 'url': url,
+            'snippet': str(item.get('snippet') or '')[:2000],
+            'source': str(item.get('source') or source_name or source_id),
+            'metadata': metadata,
+        })
+        out.append(row)
+        if len(out) >= max(1, int(max_results)):
+            break
+    return out
 
 
 def get_auth_source_provider() -> Optional[AuthSourceProvider]:

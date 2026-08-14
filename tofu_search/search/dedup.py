@@ -1,14 +1,69 @@
-"""lib/search/dedup.py — Content deduplication for search results."""
+"""URL and content deduplication for search results."""
 
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from tofu_search.log import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ['dedup_by_content']
+__all__ = ['canonical_url_key', 'dedup_by_content', 'dedup_by_full_content']
 
 _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uac00-\ud7af\u3040-\u30ff]')
+_PERCENT_ESCAPE_RE = re.compile(r'%([0-9a-fA-F]{2})')
+_UNRESERVED = frozenset(
+    'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~')
+_TRACKING_QUERY_KEYS = frozenset({
+    'dclid', 'fbclid', 'gclid', 'gbraid', 'msclkid', 'mc_cid', 'mc_eid',
+    's_cid', 'vero_conv', 'vero_id', 'wbraid', 'yclid', '_hsenc', '_hsmi',
+})
+
+
+def _decode_unreserved(match: re.Match) -> str:
+    char = chr(int(match.group(1), 16))
+    return char if char in _UNRESERVED else match.group(0).upper()
+
+
+def canonical_url_key(url: str) -> str:
+    """Return a conservative canonical key for cross-engine URL deduplication.
+
+    Fragments and well-known analytics parameters never identify different page
+    content, while scheme, default ports, parameter order and percent-encoding
+    routinely differ across engines. Meaningful query parameters are preserved.
+    Unlike the old 150-character truncation, this never conflates two long URLs
+    that only diverge near the end.
+    """
+    raw = (url or '').strip()
+    if not raw:
+        return ''
+    try:
+        parts = urlsplit(raw)
+        host = (parts.hostname or '').lower().rstrip('.')
+        if not host:
+            return raw.lower().rstrip('/')
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port and not ((parts.scheme.lower() == 'http' and port == 80)
+                         or (parts.scheme.lower() == 'https' and port == 443)):
+            host = f'{host}:{port}'
+
+        path = _PERCENT_ESCAPE_RE.sub(_decode_unreserved, parts.path or '/')
+        if path != '/':
+            path = path.rstrip('/')
+
+        query = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            lowered = key.lower()
+            if lowered.startswith('utm_') or lowered in _TRACKING_QUERY_KEYS:
+                continue
+            query.append((key, value))
+        query.sort(key=lambda pair: (pair[0], pair[1]))
+        suffix = f'?{urlencode(query, doseq=True)}' if query else ''
+        return f'{host}{path}{suffix}'
+    except Exception:
+        return raw.lower().split('#', 1)[0].rstrip('/')
 
 
 def _text_to_shingles(text: str) -> set[str]:
@@ -90,3 +145,79 @@ def dedup_by_content(results: list[dict], threshold: float = 0.45) -> list[dict]
         logger.info('[ContentDedup] %d->%d results (removed %d near-duplicates, threshold=%.2f)',
                     len(results), len(keep), removed, threshold)
     return keep
+
+
+def _full_text_shingles(text: str) -> set[str]:
+    """Word/CJK trigrams for near-copy detection, bounded for predictable cost."""
+    if not text:
+        return set()
+    # The head contains the article identity; the tail helps distinguish pages
+    # with a shared site template. The extractor's link inventory is excluded.
+    marker = text.find('--- Page Links ---')
+    if marker >= 0:
+        text = text[:marker]
+    if len(text) > 28_000:
+        text = text[:24_000] + '\n' + text[-4_000:]
+    lowered = text.lower()
+    latin = re.findall(r'[a-z0-9_]{2,}', _CJK_RE.sub(' ', lowered))
+    cjk = _CJK_RE.findall(lowered)
+    shingles = {
+        'w:' + '\x1f'.join(latin[i:i + 3])
+        for i in range(max(0, len(latin) - 2))
+    }
+    shingles.update(
+        'c:' + ''.join(cjk[i:i + 3])
+        for i in range(max(0, len(cjk) - 2))
+    )
+    return shingles
+
+
+def _merge_duplicate_evidence(kept: dict, duplicate: dict) -> None:
+    sources = []
+    for result in (kept, duplicate):
+        for source in result.get('sources') or [result.get('source')]:
+            if source and source not in sources:
+                sources.append(source)
+    if sources:
+        kept['sources'] = sources
+        kept['engine_count'] = max(
+            len(sources), kept.get('engine_count', 1), duplicate.get('engine_count', 1))
+    duplicate_url = duplicate.get('url')
+    if duplicate_url and duplicate_url != kept.get('url'):
+        urls = kept.setdefault('duplicate_urls', [])
+        if duplicate_url not in urls:
+            urls.append(duplicate_url)
+
+
+def dedup_by_full_content(results: list[dict], threshold: float = 0.78) -> list[dict]:
+    """Remove fetched mirrors/syndicated copies before LLM filtering and output.
+
+    Snippet dedup runs before fetching; this second pass catches different URLs
+    whose extracted articles are actual near-copies. Snippet-only candidates are
+    retained because there is no content evidence on which to collapse them.
+    """
+    if len(results) <= 1:
+        return results
+    fingerprints = [_full_text_shingles(r.get('full_content') or '') for r in results]
+    kept: list[dict] = []
+    kept_indices: list[int] = []
+    removed = 0
+    for idx, result in enumerate(results):
+        fp = fingerprints[idx]
+        duplicate_of = None
+        if fp:
+            for kept_pos, kept_idx in enumerate(kept_indices):
+                other = fingerprints[kept_idx]
+                if other and _jaccard(fp, other) >= threshold:
+                    duplicate_of = kept_pos
+                    break
+        if duplicate_of is None:
+            kept.append(result)
+            kept_indices.append(idx)
+        else:
+            removed += 1
+            _merge_duplicate_evidence(kept[duplicate_of], result)
+    if removed:
+        logger.info('[FullContentDedup] %d->%d results (removed %d mirrors, threshold=%.2f)',
+                    len(results), len(kept), removed, threshold)
+    return kept

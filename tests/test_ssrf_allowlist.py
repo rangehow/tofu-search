@@ -8,7 +8,6 @@ observed as both 10.176.18.71 and 10.192.19.176 within one session), so an
 IP-based allowlist silently rots — while the hostname stays stable.
 """
 
-import ipaddress
 from unittest import mock
 
 import pytest

@@ -65,15 +65,28 @@ def test_gate_useful_returns_original_text():
     assert '§§IRRELEVANT§§' in (calls[0]['kwargs'].get('stop') or [])
 
 
-def test_gate_caps_input_at_gate_input_max_chars():
+def test_gate_selects_within_gate_input_max_chars():
     calls = []
     raw = 'x' * 20_000
     cfg = _cfg(_fake_llm(calls, '[USEFUL]'))
     filter_web_content(raw, url='https://example.com/long', query='q', config=cfg)
     user_msg = calls[0]['messages'][1]['content']
-    assert 'first 12,000 of 20,000' in user_msg  # header announces the cap
-    assert 'x' * 12_000 in user_msg              # body is exactly the capped head
-    assert 'x' * 12_001 not in user_msg
+    assert 'selected ' in user_msg
+    payload = user_msg.split('---\n', 1)[-1]
+    assert 0 < len(payload) <= 12_000
+
+
+def test_gate_can_see_relevant_section_beyond_old_head():
+    calls = []
+    raw = ('navigation filler words\n\n' * 900
+           + 'The decisive quasar latency benchmark is 17 milliseconds.\n\n'
+           + 'footer filler\n\n' * 100)
+    cfg = _cfg(_fake_llm(calls, '[USEFUL]'), gate_input_max_chars=4_000)
+    filter_web_content(raw, url='https://example.com/late',
+                       query='quasar latency benchmark', config=cfg)
+    user_msg = calls[0]['messages'][1]['content']
+    assert '17 milliseconds' in user_msg
+    assert len(user_msg) < len(raw)
 
 
 def test_gate_irrelevant_stop_token_returns_sentinel():

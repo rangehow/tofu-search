@@ -45,7 +45,11 @@ from tofu_search.fetch.utils import (
     _should_fetch,
 )
 from tofu_search.log import get_logger
-from tofu_search.providers import get_auth_source_provider
+from tofu_search.providers import (
+    get_auth_source_provider,
+    submit_with_provider_context,
+    with_bound_optional_providers,
+)
 
 logger = get_logger(__name__)
 
@@ -84,6 +88,7 @@ def _mk_deadline_playwright(budget_blown):
     return _wrapped
 
 
+@with_bound_optional_providers
 def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
                        deadline_secs=None, diag=None):
     """Fetch ``url`` and return extracted text, or ``None`` on failure.
@@ -270,6 +275,16 @@ def fetch_page_content(url, max_chars=None, pdf_max_chars=None, timeout=None,
     except TypeError:
         _allowed = _should_fetch(url)
     if not _allowed:
+        # The SSRF gate protects requests made by this process.  A host browser
+        # provider executes inside the user's own browser/network and has its
+        # own per-user domain policy, so private-address refusal must not make
+        # that path unreachable. Other gates (scheme, download size, explicit
+        # skip-domain, circuit) remain server-side refusals.
+        if _gate.get('reason') == 'ssrf_blocked':
+            browser_text = _try_browser_fetch(
+                url, max_chars, reason='server_ssrf_browser_bypass')
+            if browser_text:
+                return browser_text
         return _diag(_gate.get('reason', 'refused'),
                      _gate.get('detail', 'URL refused before any request was made.'))
 
@@ -628,7 +643,7 @@ def fetch_contents_for_results(results, max_fetch=None, max_chars=None, target_o
     # correlated with native aborts. Stop *using* results past target_ok,
     # but keep consuming completions so each thread closes cleanly.
     with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = {pool.submit(_do, r): r for r in to_fetch}
+        futs = {submit_with_provider_context(pool, _do, r): r for r in to_fetch}
         target_reached_at = None
         try:
             for fut in as_completed(futs, timeout=90):
@@ -686,7 +701,7 @@ def fetch_urls(urls, max_chars=None, pdf_max_chars=None, timeout=None):
                                      pdf_max_chars=pdf_max_chars, timeout=timeout)
     deadline = max(timeout * 4, 120)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(_do, u): u for u in urls}
+        futs = {submit_with_provider_context(pool, _do, u): u for u in urls}
         done_count = 0
         try:
             for fut in as_completed(futs, timeout=deadline):

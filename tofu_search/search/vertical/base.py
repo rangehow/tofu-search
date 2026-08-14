@@ -115,7 +115,8 @@ def _decode_body(resp, label=''):
 
 
 def _post_json(url, *, payload=None, headers=None, timeout=_TIMEOUT, label='',
-               retry_on_429=True, return_response=False, raw_body=None):
+               retry_on_429=True, return_response=False,
+               return_error_response=False, raw_body=None):
     """POST ``payload`` as JSON and return the decoded JSON object.
 
     The POST counterpart of :func:`_fetch_json`, and the single transport seam
@@ -127,7 +128,10 @@ def _post_json(url, *, payload=None, headers=None, timeout=_TIMEOUT, label='',
     Returns the parsed object, ``_FETCH_UNAUTHORIZED`` on HTTP 401/403, or
     ``_FETCH_FAILED`` on any other failure. With ``return_response=True`` the
     raw ``Response`` is returned instead (used only by the MCP session-handshake
-    fallback, which needs the ``Mcp-Session-Id`` response header).
+    fallback, which needs the ``Mcp-Session-Id`` response header).  With
+    ``return_error_response=True``, a non-auth HTTP error is returned raw so a
+    protocol adapter can distinguish an old-server rejection from a network
+    failure; ordinary callers should keep the default sentinel behaviour.
     """
     hdrs = dict(_HEADERS)
     if headers:
@@ -155,6 +159,6 @@ def _post_json(url, *, payload=None, headers=None, timeout=_TIMEOUT, label='',
         if not resp.ok:
             logger.warning('[Vertical] %s returned HTTP %d for %s',
                            label or 'post', resp.status_code, url[:80])
-            return _FETCH_FAILED
+            return resp if return_error_response else _FETCH_FAILED
         return resp if return_response else _decode_body(resp, label)
     return _FETCH_FAILED

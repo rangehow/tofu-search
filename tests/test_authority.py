@@ -113,11 +113,15 @@ def test_diversify_covers_each_named_entity():
     # so this fixture genuinely exercises the branch.
     _g = rerank_by_bm25.__globals__
     _orig = _g["_diversify_by_entity"]
+    _orig_domain = _g["_diversify_by_domain"]
     _g["_diversify_by_entity"] = lambda *a, **k: None
+    _g["_diversify_by_domain"] = lambda q, scored, top_k: [
+        item[2] for item in scored[:top_k]]
     try:
         plain = rerank_by_bm25(q, results, top_k=3)
     finally:
         _g["_diversify_by_entity"] = _orig
+        _g["_diversify_by_domain"] = _orig_domain
     assert {r["url"].split("/")[2] for r in plain} == {"blog.cloudflare.com",
                                                         "www.cloudflare.com"}
 

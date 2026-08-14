@@ -56,11 +56,15 @@ from tofu_search.providers import (
     AuthSourceProvider,
     BrowserProvider,
     SiteKnowledgeProvider,
+    SiteSearchProvider,
     clear_site_drift_listeners,
+    get_site_search_provider,
+    normalize_site_search_results,
     register_auth_source_provider,
     register_browser_provider,
     register_site_drift_listener,
     register_site_knowledge_provider,
+    register_site_search_provider,
 )
 from tofu_search.search.format import format_search_for_tool_response as format_results
 from tofu_search.search.orchestrator import perform_web_search
@@ -108,9 +112,13 @@ __all__ = [
     'summarize',
     # Provider seams (host integration)
     'BrowserProvider',
+    'SiteSearchProvider',
     'AuthSourceProvider',
     'SiteKnowledgeProvider',
     'register_browser_provider',
+    'register_site_search_provider',
+    'get_site_search_provider',
+    'normalize_site_search_results',
     'register_auth_source_provider',
     'register_site_knowledge_provider',
     'register_site_drift_listener',

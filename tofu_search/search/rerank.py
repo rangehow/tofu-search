@@ -11,6 +11,7 @@ latency from the search pipeline.
 import math
 import re
 import time
+from urllib.parse import urlparse
 
 from tofu_search.log import get_logger
 from tofu_search.search.authority import (
@@ -34,6 +35,11 @@ BM25_B = 0.75
 # Truncate documents to this many chars before tokenizing.
 # Keeps reranking fast even for very long pages.
 _MAX_RERANK_CHARS = 8_000
+
+# Search-engine rank/consensus and successful extraction are useful weak
+# signals, but lexical relevance and authority must remain dominant.
+RRF_WEIGHT = 8.0
+CONTENT_AVAILABLE_BOOST = 0.25
 
 # Common English stop words
 _STOP_WORDS = frozenset({
@@ -104,7 +110,9 @@ def _build_doc_text(r: dict) -> str:
     snippet = (r.get('snippet') or '').strip()
 
     if full:
-        text = f'{title}\n\n{full}' if title else full
+        # SERP titles/snippets are compact relevance judgments from the search
+        # engines. Repeat them so they are not drowned by an 8k article body.
+        text = f'{title}\n{title}\n{title}\n{snippet}\n{snippet}\n{full}'
         return text[:_MAX_RERANK_CHARS]
     else:
         return f'{title} {snippet}' if title else snippet
@@ -173,6 +181,49 @@ def _diversify_by_entity(
 
     selected_ranks.sort()  # present in global-score order (best first)
     return [scored[r][2] for r in selected_ranks]
+
+
+def _domain_key(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+    labels = [label for label in host.split('.') if label]
+    if len(labels) >= 3 and labels[-2] in {'co', 'com', 'org', 'net', 'gov', 'edu', 'ac'} \
+            and len(labels[-1]) == 2:
+        return '.'.join(labels[-3:])
+    return '.'.join(labels[-2:]) if len(labels) >= 2 else host
+
+
+def _diversify_by_domain(
+    query: str, scored: list[tuple[float, int, dict]], top_k: int,
+    max_per_domain: int = 2,
+) -> list[dict]:
+    """Avoid a top-K monopolized by one host, without reducing result count."""
+    if re.search(r'(?i)(?:^|\s)site:', query or ''):
+        return [item[2] for item in scored[:top_k]]
+    chosen: list[dict] = []
+    chosen_ids: set[int] = set()
+    counts: dict[str, int] = {}
+    for _score, idx, result in scored:
+        domain = _domain_key(result.get('url') or '')
+        if domain and counts.get(domain, 0) >= max_per_domain:
+            continue
+        chosen.append(result)
+        chosen_ids.add(idx)
+        if domain:
+            counts[domain] = counts.get(domain, 0) + 1
+        if len(chosen) >= top_k:
+            return chosen
+    # If the candidate pool contains only one or two hosts, fill the remaining
+    # slots in score order rather than returning fewer results.
+    for _score, idx, result in scored:
+        if idx not in chosen_ids:
+            chosen.append(result)
+            chosen_ids.add(idx)
+        if len(chosen) >= top_k:
+            break
+    return chosen
 
 
 def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
@@ -246,6 +297,15 @@ def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
         tier = classify_authority(result.get('url') or '', query)
         score += AUTHORITY_BOOST.get(tier, 0.0)
 
+        # Reciprocal-rank fusion is accumulated by the orchestrator when the
+        # same canonical URL appears in multiple engine lists. A SearXNG result
+        # may also carry its own upstream engine_count.
+        score += float(result.get('rrf_score') or 0.0) * RRF_WEIGHT
+        engine_count = max(1, int(result.get('engine_count') or 1))
+        score += min(0.9, math.log2(engine_count) * 0.3)
+        if result.get('full_content'):
+            score += CONTENT_AVAILABLE_BOOST
+
         scored.append((score, i, result))
 
     # Sort by score descending, break ties by original position
@@ -255,7 +315,7 @@ def rerank_by_bm25(query: str, results: list[dict], top_k: int) -> list[dict]:
     if diversified is not None:
         selected = diversified
     else:
-        selected = [item[2] for item in scored[:top_k]]
+        selected = _diversify_by_domain(query, scored, top_k)
 
     elapsed = time.time() - t0
     scores_str = ', '.join(f'#{item[1]}:{item[0]:.3f}' for item in scored[:top_k])

@@ -20,9 +20,9 @@ All offline: providers are fakes registered through tofu_search.providers.
 import pytest
 
 import tofu_search
-from tofu_search.search.engines import xhs
 from tofu_search.fetch import core as fetch_core
 from tofu_search.fetch import interactive_login
+from tofu_search.search.engines import xhs
 
 pytestmark = pytest.mark.unit
 

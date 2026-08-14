@@ -10,7 +10,8 @@ Pipeline order (cheap → expensive):
   2b. Pre-fetch gate — drop the FETCH of results with zero query-term overlap
       (off-topic SERP junk), fail-open, no LLM. See search/prefetch_gate.py.
   3. Content dedup (Jaccard on title+snippet shingles) — once after engines.
-  5. LLM content filter — relevance verdict + noise removal (if LLM configured).
+  5. Optional LLM filter — cheap relevance verdict by default; rewrite mode
+      can also regenerate cleaned text.
   6. BM25 rerank — on cleaned full text → top-N (pure Python, no API call).
 """
 # HOT_PATH
@@ -23,8 +24,18 @@ from tofu_search.config import get_config
 from tofu_search.fetch import fetch_page_content
 from tofu_search.fetch.content_filter import IRRELEVANT_SENTINEL, filter_web_contents_batch
 from tofu_search.log import get_logger
+from tofu_search.providers import (
+    get_site_search_provider,
+    normalize_site_search_results,
+    submit_with_provider_context,
+    with_bound_optional_providers,
+)
 from tofu_search.search.browser_fallback import search_via_browser
-from tofu_search.search.dedup import dedup_by_content
+from tofu_search.search.dedup import (
+    canonical_url_key,
+    dedup_by_content,
+    dedup_by_full_content,
+)
 from tofu_search.search.deepen import deepen_results, is_deepen_enabled
 from tofu_search.search.engines.bing import search_bing
 from tofu_search.search.engines.brave import search_brave
@@ -53,15 +64,11 @@ class SearchResultList(list):
 
 
 def _url_dedup_key(url: str) -> str:
-    """Normalise a URL into a dedup key (strip only the leading scheme)."""
-    key = url.lower().rstrip('/')
-    for scheme in ('https://', 'http://'):
-        if key.startswith(scheme):
-            key = key[len(scheme):]
-            break
-    return key[:150]
+    """Compatibility wrapper around the shared canonical URL key."""
+    return canonical_url_key(url)
 
 
+@with_bound_optional_providers
 def perform_web_search(query, max_results=None, user_question='', freshness='',
                        *, fetch_pages=True, filter_pages=True, rerank=True,
                        engines=None, max_chars_per_page=None, deepen=None,
@@ -114,12 +121,15 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     _lock = threading.Lock()
     seen_urls: set[str] = set()
+    seen_results: dict[str, dict] = {}
     all_results: list[dict] = []
     unique_results: list[dict] = []
     fetch_futs: dict[Future, dict] = {}
+    submitted_fetch_keys: set[str] = set()
+    fetch_eligible_keys: set[str] = set()
     url_timings: list[tuple] = []
 
-    target_ok = config.fetch_top_n * 2
+    target_ok = max_results * 2
 
     engine_counts = {}
     engine_timings = {}
@@ -127,6 +137,40 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     engine_empty = []
 
     ALL_ENGINE_NAMES = ['DDG-HTML', 'Brave', 'Bing', 'DDG-API', 'SearXNG', 'Marginalia']
+    site_engine_specs = []
+    site_provider = get_site_search_provider()
+    if site_provider is not None:
+        try:
+            site_sources = site_provider.list_sources() or []
+        except Exception as exc:
+            logger.warning('[Search] site-search source discovery failed: %s', exc)
+            site_sources = []
+        for source in site_sources:
+            if isinstance(source, str):
+                source = {'id': source, 'name': source}
+            if not isinstance(source, dict) or not source.get('id'):
+                continue
+            source_id = str(source['id'])
+            # Xiaohongshu has its own paced/backoff engine below.  It calls the
+            # same provider internally, so adding it again would double-hit the
+            # user's account for one query.
+            aliases = {str(a).lower() for a in source.get('aliases', [])}
+            if source_id.lower() in ('xiaohongshu', 'xhs') or 'xhs' in aliases:
+                continue
+            tag = 'Site:' + source_id
+            source_name = str(source.get('name') or source_id)
+
+            def _site_search(q, n=10, fresh='', *, _sid=source_id,
+                             _name=source_name):
+                raw = site_provider.search(_sid, q, max_results=n,
+                                           freshness=fresh)
+                if raw is None:
+                    return []
+                return normalize_site_search_results(
+                    raw, source_id=_sid, source_name=_name, max_results=n)
+
+            site_engine_specs.append((tag, _site_search, 10))
+            ALL_ENGINE_NAMES.append(tag)
     _xhs_on = xhs_search_available()
     if _xhs_on:
         ALL_ENGINE_NAMES.append('Xiaohongshu')
@@ -149,18 +193,72 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     fetch_pool = ThreadPoolExecutor(max_workers=16)
     first_fetch_submitted_at = None
+    fetch_candidate_budget = max(12, max_results * 3)
+    stream_batch_cap = max(2, (max_results + 1) // 2)
 
-    def _submit_fetches_for_batch(batch: list[dict]):
+    def _do_fetch(result_dict):
+        url = result_dict['url']
+        t0 = time.time()
+        content = fetch_page_content(url, max_chars=max_chars, pdf_max_chars=pdf_max_chars)
+        elapsed = time.time() - t0
+        return result_dict, content, elapsed
+
+    def _submit_selected(candidates: list[dict], limit: int | None = None):
+        """Submit a bounded set without letting the fastest engine monopolize workers."""
+        nonlocal first_fetch_submitted_at
+        submitted = 0
+        with _lock:
+            for result in candidates:
+                key = _url_dedup_key(result.get('url') or '')
+                if (not key or key in submitted_fetch_keys
+                        or len(submitted_fetch_keys) >= fetch_candidate_budget):
+                    continue
+                fut = submit_with_provider_context(fetch_pool, _do_fetch, result)
+                fetch_futs[fut] = result
+                submitted_fetch_keys.add(key)
+                submitted += 1
+                if limit is not None and submitted >= limit:
+                    break
+            if submitted and first_fetch_submitted_at is None:
+                first_fetch_submitted_at = time.time()
+                logger.info('[Search] First fetch submitted at +%.1fs (pipeline overlap started)',
+                            first_fetch_submitted_at - pipeline_t0)
+
+    def _submit_fetches_for_batch(batch: list[dict], engine_tag: str = ''):
         """Dedup a batch of engine results and submit new URLs to fetch pool."""
         nonlocal first_fetch_submitted_at
         new_results = []
         with _lock:
-            for r in batch:
+            for rank, r in enumerate(batch, 1):
                 key = _url_dedup_key(r['url'])
                 if key not in seen_urls:
                     seen_urls.add(key)
+                    source = engine_tag or r.get('source') or 'Unknown'
+                    r['sources'] = list(dict.fromkeys(
+                        (r.get('sources') or []) + [source]))
+                    r['engine_count'] = max(
+                        len(r['sources']), int(r.get('engine_count') or 1))
+                    r['rrf_score'] = float(r.get('rrf_score') or 0.0) + 1.0 / (60 + rank)
+                    r['source_rank'] = rank
+                    seen_results[key] = r
                     unique_results.append(r)
                     new_results.append(r)
+                else:
+                    # Merge independent engine evidence instead of silently
+                    # discarding it. This feeds reciprocal-rank fusion later.
+                    kept = seen_results[key]
+                    source = engine_tag or r.get('source') or 'Unknown'
+                    sources = kept.setdefault('sources', [kept.get('source', 'Unknown')])
+                    if source not in sources:
+                        sources.append(source)
+                        kept['rrf_score'] = float(kept.get('rrf_score') or 0.0) + 1.0 / (60 + rank)
+                    kept['engine_count'] = max(
+                        len(sources), int(kept.get('engine_count') or 1),
+                        int(r.get('engine_count') or 1))
+                    if len(r.get('snippet') or '') > len(kept.get('snippet') or ''):
+                        kept['snippet'] = r.get('snippet') or ''
+                    if len(r.get('title') or '') > len(kept.get('title') or ''):
+                        kept['title'] = r.get('title') or ''
             all_results.extend(batch)
 
         if not new_results or not fetch_pages:
@@ -185,21 +283,11 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         if not to_fetch:
             return
 
-        def _do_fetch(result_dict):
-            url = result_dict['url']
-            t0 = time.time()
-            content = fetch_page_content(url, max_chars=max_chars, pdf_max_chars=pdf_max_chars)
-            elapsed = time.time() - t0
-            return result_dict, content, elapsed
-
-        with _lock:
-            for r in to_fetch:
-                fut = fetch_pool.submit(_do_fetch, r)
-                fetch_futs[fut] = r
-            if first_fetch_submitted_at is None:
-                first_fetch_submitted_at = time.time()
-                logger.info('[Search] First fetch submitted at +%.1fs (pipeline overlap started)',
-                            first_fetch_submitted_at - pipeline_t0)
+        fetch_eligible_keys.update(_url_dedup_key(r['url']) for r in to_fetch)
+        # Start a few top candidates immediately for pipeline overlap, but leave
+        # worker capacity for slower engines. Once all SERPs arrive, a cheap
+        # global rank fills the remaining candidate budget below.
+        _submit_selected(to_fetch, stream_batch_cap)
 
     # ══ Step 1: Fire all engines + immediate fetch submission ══
     step1_t0 = time.time()
@@ -212,15 +300,20 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
         ('SearXNG',  search_searxng,   6),
         ('Marginalia', search_marginalia, 6),
     ]
+    _ENGINE_SPECS.extend(site_engine_specs)
     if _xhs_on and 'Xiaohongshu' in engine_allow:
         _ENGINE_SPECS.append(('Xiaohongshu', search_xhs, 10))
-    with ThreadPoolExecutor(max_workers=max(1, len(engine_allow))) as engine_pool:
-        engine_futs = {
-            engine_pool.submit(fn, query, n, freshness): tag
-            for tag, fn, n in _ENGINE_SPECS if tag in engine_allow
-        }
+    engine_pool = ThreadPoolExecutor(max_workers=max(1, len(engine_allow)))
+    engine_futs = {
+        submit_with_provider_context(engine_pool, fn, query, n, freshness): tag
+        for tag, fn, n in _ENGINE_SPECS if tag in engine_allow
+    }
+    _engine_timeout = False
+    try:
+        _left = _budget_left()
+        _engine_wait = 20.0 if _left is None else max(0.001, min(20.0, _left))
         try:
-            for fut in as_completed(engine_futs, timeout=20):
+            for fut in as_completed(engine_futs, timeout=_engine_wait):
                 tag = engine_futs[fut]
                 engine_elapsed = time.time() - step1_t0
                 try:
@@ -230,7 +323,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                         engine_timings[tag] = engine_elapsed
                         logger.info('[Search] %s returned %d results in %.1fs -> submitting fetches',
                                     tag, len(r), engine_elapsed)
-                        _submit_fetches_for_batch(r)
+                        _submit_fetches_for_batch(r, tag)
                     else:
                         engine_empty.append(tag)
                         engine_timings[tag] = engine_elapsed
@@ -240,13 +333,21 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     engine_errors[tag] = str(e)[:200]
                     engine_timings[tag] = engine_elapsed
         except TimeoutError:
+            _engine_timeout = True
             timed_out = [engine_futs[f] for f in engine_futs if not f.done()]
             for name in timed_out:
-                engine_errors[name] = 'Timed out after 20s'
-                engine_timings[name] = 20.0
-            logger.warning('[Search] %d/%d engines timed out (%s), keeping %d results from others. query=%r',
-                           len(timed_out), len(engine_futs), ', '.join(timed_out),
-                           len(all_results), query[:80])
+                engine_errors[name] = 'Timed out after %.1fs' % _engine_wait
+                engine_timings[name] = _engine_wait
+            if _budget_left() is not None and _budget_left() <= 0:
+                _deadline_hit = True
+            logger.warning('[Search] %d/%d engines timed out after %.1fs (%s), '
+                           'keeping %d results from others. query=%r',
+                           len(timed_out), len(engine_futs), _engine_wait,
+                           ', '.join(timed_out), len(all_results), query[:80])
+    finally:
+        # A ThreadPoolExecutor context manager always waits for timed-out calls
+        # on exit, defeating both the 20s engine cap and the global deadline.
+        engine_pool.shutdown(wait=not _engine_timeout, cancel_futures=True)
 
     step_timings['step1_engines'] = time.time() - step1_t0
 
@@ -257,24 +358,33 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     query[:60])
 
     # ── Retry: if we got nothing, give DDG+Brave another chance ──
-    if not all_results:
+    # A synchronous engine retry cannot be cancelled mid-request. Reserve its
+    # normal network timeout instead of starting it with only milliseconds left
+    # and quietly violating the advertised whole-search deadline.
+    _left = _budget_left()
+    if not all_results and not _deadline_hit and (_left is None or _left > 11):
         logger.info('[Search] 0 results on first attempt, retrying DDG+Brave after 0.8s for query=%r', query[:80])
         time.sleep(0.8)
         retry = search_ddg_html(query, max_results)
         if retry:
-            _submit_fetches_for_batch(retry)
+            _submit_fetches_for_batch(retry, 'DDG-HTML')
         else:
-            retry_brave = search_brave(query, max_results)
-            if retry_brave:
-                _submit_fetches_for_batch(retry_brave)
+            _left = _budget_left()
+            if _left is None or _left > 11:
+                retry_brave = search_brave(query, max_results)
+                if retry_brave:
+                    _submit_fetches_for_batch(retry_brave, 'Brave')
 
     # ── Browser fallback: server network may be down but user browser works ──
-    if not all_results:
+    # The provider contract permits a 25s browser fetch, so do not start one
+    # unless that much search budget remains.
+    _left = _budget_left()
+    if not all_results and not _deadline_hit and (_left is None or _left > 25):
         browser_results = search_via_browser(query, max_results)
         if browser_results:
             logger.info('[Search] Browser fallback produced %d results for query=%r',
                         len(browser_results), query[:80])
-            _submit_fetches_for_batch(browser_results)
+            _submit_fetches_for_batch(browser_results, 'Browser')
 
     # ── Build engine breakdown for diagnostics (before dedup) ──
     engine_breakdown = {}
@@ -295,6 +405,14 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     content_dedup_count = len(unique_results)
     step_timings['step3_content_dedup'] = time.time() - step3_t0
 
+    if fetch_pages and len(submitted_fetch_keys) < fetch_candidate_budget:
+        eligible = [r for r in unique_results
+                    if _url_dedup_key(r['url']) in fetch_eligible_keys]
+        if eligible:
+            ranked_candidates = rerank_by_bm25(
+                query, eligible, min(fetch_candidate_budget, len(eligible)))
+            _submit_selected(ranked_candidates)
+
     kept_urls = {r['url'] for r in unique_results}
 
     # ── Dynamically reduce target_ok when candidate pool is too small ──
@@ -311,6 +429,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     with _lock:
         pending_futs = set(fetch_futs.keys())
 
+    _race_to_n_hit = False
     if pending_futs:
         logger.info('[Fetch] Waiting for %d in-flight fetches (started %.1fs ago), target_ok=%d',
                     len(pending_futs), time.time() - (first_fetch_submitted_at or pipeline_t0),
@@ -357,6 +476,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                     break
 
                 if kept_ok >= target_ok:
+                    _race_to_n_hit = True
                     remaining = [f for f in pending_futs if not f.done()]
                     if remaining:
                         elapsed_so_far = time.time() - (first_fetch_submitted_at or step4_t0)
@@ -377,15 +497,24 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
             else:
                 logger.warning('[Fetch] as_completed timeout (%.0fs)', _wait_ceiling, exc_info=True)
 
-    # On a deadline hit, do NOT block joining still-running fetch threads —
-    # shutdown(wait=True) would re-introduce the very hang we're bounding.
-    fetch_pool.shutdown(wait=not _deadline_hit, cancel_futures=True)
+    # On a deadline or Race-to-N exit, do NOT join still-running fetch threads:
+    # shutdown(wait=True) would erase the latency benefit of the early return.
+    fetch_pool.shutdown(wait=not (_deadline_hit or _race_to_n_hit), cancel_futures=True)
 
-    fetch_count = sum(1 for r in unique_results if r.get('full_content'))
+    fetched_raw_count = sum(1 for r in unique_results if r.get('full_content'))
     step_timings['step4_page_fetch'] = time.time() - step4_t0
 
+    # Different URLs can be mirrors or syndicated copies. Collapse them before
+    # the LLM gate so one article never consumes several model calls / slots.
+    step4c_t0 = time.time()
+    unique_results = dedup_by_full_content(unique_results)
+    fetch_count = sum(1 for r in unique_results if r.get('full_content'))
+    full_content_dedup_count = fetched_raw_count - fetch_count
+    step_timings['step4c_full_content_dedup'] = time.time() - step4c_t0
+
     # ── Step 4b: One-hop link-following (depth) — opt-in ──
-    _do_deepen = is_deepen_enabled() if deepen is None else deepen
+    _do_deepen = (bool(getattr(config, 'deepen_enabled', False))
+                  or is_deepen_enabled()) if deepen is None else deepen
     if _deadline_hit and _do_deepen:
         logger.info('[Search] step4b deepen skipped — deadline hit')
         _do_deepen = False
@@ -417,7 +546,7 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
                         first_fetch_submitted_at - pipeline_t0,
                         step_timings['step1_engines'])
 
-    # ── Step 5: LLM content filter — relevance + cleaning ──
+    # ── Step 5: LLM relevance gate (or opt-in rewrite/cleaning mode) ──
     step5_t0 = time.time()
     irrelevant_urls: set[str] = set()
     _filter_on = config.filter_enabled and config.has_llm()
@@ -464,12 +593,8 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
 
     # ── Step 6: BM25 rerank on cleaned full text → top-N ──
     step6_t0 = time.time()
-    if _deadline_hit:
-        logger.debug('[Search] step6 rerank skipped — deadline hit')
-    elif not rerank:
+    if not rerank:
         logger.debug('[Search] step6 skipped — caller passed rerank=False')
-    elif len(has_content) > max_results:
-        relevant = rerank_by_bm25(query, has_content, max_results)
     elif len(relevant) > max_results:
         relevant = rerank_by_bm25(query, relevant, max_results)
     final_count = min(len(relevant), max_results)
@@ -486,10 +611,11 @@ def perform_web_search(query, max_results=None, user_question='', freshness='',
     timing_str = ', '.join(timing_parts)
 
     logger.info('[Search] Pipeline: %d raw -> %d url-dedup -> %d content-dedup -> '
-                '%d fetched -> -%d irrelevant -> %d relevant -> %d reranked  '
+                '%d fetched -> -%d mirrored -> -%d irrelevant -> %d relevant -> %d reranked  '
                 'TOTAL=%.1fs  [%s]  query=%r',
                 len(all_results), url_dedup_count, content_dedup_count,
-                fetch_count, len(irrelevant_urls), len(relevant),
+                fetched_raw_count, full_content_dedup_count,
+                len(irrelevant_urls), len(relevant),
                 final_count, pipeline_total, timing_str, query[:60])
 
     if url_timings:
